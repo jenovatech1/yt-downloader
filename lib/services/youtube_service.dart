@@ -49,7 +49,7 @@ class YoutubeService {
 
   Future<StreamManifest> getManifest(String videoId) async {
     // ANDROID (dengan sdkVersion) sering 403/fatal. Jangan dipakai.
-    const clients = [
+    final clients = [
       YoutubeApiClient.androidSdkless,
       YoutubeApiClient.ios,
       YoutubeApiClient.safari,
