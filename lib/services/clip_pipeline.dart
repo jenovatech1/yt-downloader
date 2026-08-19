@@ -73,7 +73,7 @@ class ClipPipeline {
     try {
     emit('Menyiapkan audio (${option.label})...', 0.02);
     final manifest = await yt.getManifest(video.id.value);
-    final audioInfo = yt.compactAudio(manifest) ?? yt.bestAudio(manifest);
+    final audioInfo = yt.bestAudio(manifest) ?? yt.compactAudio(manifest);
     final videoOnly = yt.videoOnlyAt(manifest, option.height) ?? option.videoOnly;
     final muxed = yt.muxedAt(manifest, option.height) ?? option.muxed;
     final videoUrl = videoOnly?.url.toString() ?? muxed?.url.toString();
@@ -104,9 +104,11 @@ class ClipPipeline {
 
     Object? lastError;
     var downloaded = false;
+    var audio = audioInfo;
+    var audioPath = rawAudio;
     for (var attempt = 1; attempt <= 2; attempt++) {
       try {
-        await yt.downloadToFile(audioInfo, rawAudio, onBytes: (received, total) {
+        await yt.downloadToFile(audio, audioPath, onBytes: (received, total) {
           final frac = total <= 0 ? 0.0 : received / total;
           emit(
             'Mengunduh audio...',
@@ -120,11 +122,16 @@ class ClipPipeline {
       } catch (e) {
         lastError = e;
         try {
-          await File(rawAudio).delete();
+          await File(audioPath).delete();
         } catch (_) {}
         if (attempt == 1) {
-          emit('Mengunduh audio (ulang)...', 0.08, total: audioInfo.size.totalBytes);
-          await Future<void>.delayed(const Duration(milliseconds: 600));
+          emit('Mengunduh audio (ulang)...', 0.08);
+          try {
+            final again = await yt.getManifest(video.id.value);
+            audio = yt.bestAudio(again) ?? audio;
+            audioPath =
+                p.join(workDir.path, 'audio.${audio.container.name}');
+          } catch (_) {}
         }
       }
     }
@@ -137,11 +144,11 @@ class ClipPipeline {
     emit('Kompres audio...', 0.32);
     final smallAudio = p.join(workDir.path, 'audio_small.m4a');
     await _ffmpeg(
-      ['-y', '-i', rawAudio, '-c:a', 'aac', '-b:a', '64k', '-ac', '1', smallAudio],
-      fallback: ['-y', '-i', rawAudio, '-c:a', 'aac', '-b:a', '64k', smallAudio],
+      ['-y', '-i', audioPath, '-c:a', 'aac', '-b:a', '64k', '-ac', '1', smallAudio],
+      fallback: ['-y', '-i', audioPath, '-c:a', 'aac', '-b:a', '64k', smallAudio],
     );
     final transcribeFile =
-        await File(smallAudio).exists() ? File(smallAudio) : File(rawAudio);
+        await File(smallAudio).exists() ? File(smallAudio) : File(audioPath);
 
     emit('Transkrip audio (AI)...', 0.40);
     final transcript = await _ai.transcribe(
@@ -200,7 +207,7 @@ class ClipPipeline {
     }
 
     try {
-      await File(rawAudio).delete();
+      await File(audioPath).delete();
       if (await File(smallAudio).exists()) await File(smallAudio).delete();
     } catch (_) {}
 

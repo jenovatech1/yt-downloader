@@ -8,7 +8,14 @@ import '../models/download_option.dart';
 class YoutubeService {
   YoutubeService() : _yt = YoutubeExplode();
 
-  final YoutubeExplode _yt;
+  YoutubeExplode _yt;
+
+  void _resetClient() {
+    try {
+      _yt.close();
+    } catch (_) {}
+    _yt = YoutubeExplode();
+  }
 
   bool looksLikeUrl(String input) {
     final trimmed = input.trim();
@@ -48,23 +55,23 @@ class YoutubeService {
   }
 
   Future<StreamManifest> getManifest(String videoId) async {
-    // ANDROID (dengan sdkVersion) sering 403/fatal. Jangan dipakai.
-    final clients = [
-      YoutubeApiClient.androidSdkless,
-      YoutubeApiClient.ios,
-      YoutubeApiClient.safari,
-      YoutubeApiClient.androidVr,
-      YoutubeApiClient.tv,
+    // ANDROID (sdkVersion) = 403 fatal. androidSdkless sering hang di HEAD.
+    // androidVr dulu yang bikin Download jalan.
+    final attempts = <List<YoutubeApiClient>>[
+      [YoutubeApiClient.androidVr],
+      [YoutubeApiClient.ios],
+      [YoutubeApiClient.tv],
+      [YoutubeApiClient.safari],
     ];
     Object? lastError;
-    for (final client in clients) {
+    for (final clients in attempts) {
       try {
-        return await _yt.videos.streamsClient.getManifest(
-          videoId,
-          ytClients: [client],
-        );
+        return await _yt.videos.streamsClient
+            .getManifest(videoId, ytClients: clients)
+            .timeout(const Duration(seconds: 12));
       } catch (e) {
         lastError = e;
+        _resetClient();
       }
     }
     throw lastError ??
@@ -221,9 +228,9 @@ class YoutubeService {
       final stream = _yt.videos.streamsClient.get(info);
       iterator = StreamIterator(stream);
       final hasFirst = await iterator.moveNext().timeout(
-        const Duration(seconds: 20),
+        const Duration(seconds: 12),
         onTimeout: () => throw TimeoutException(
-          'YouTube tidak mengirim audio (timeout 20s)',
+          'YouTube tidak mengirim data (timeout 12s)',
         ),
       );
       if (!hasFirst) {
@@ -242,9 +249,19 @@ class YoutubeService {
       if (received < 2048) {
         throw Exception('File audio terlalu kecil ($received byte)');
       }
+    } catch (e) {
+      _resetClient();
+      try {
+        if (await file.exists()) await file.delete();
+      } catch (_) {}
+      rethrow;
     } finally {
-      await iterator?.cancel();
-      await sink.close();
+      try {
+        await iterator?.cancel();
+      } catch (_) {}
+      try {
+        await sink.close();
+      } catch (_) {}
     }
   }
 
