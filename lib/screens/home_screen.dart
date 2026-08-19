@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
+import '../services/app_update_service.dart';
 import '../services/youtube_service.dart';
 import '../theme/app_theme.dart';
+import '../widgets/update_dialog.dart';
 import '../widgets/video_tile.dart';
 import 'player_screen.dart';
 import 'settings_screen.dart';
@@ -22,6 +24,12 @@ class _HomeScreenState extends State<HomeScreen> {
   List<Video> _results = [];
   bool _loading = false;
   String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    AppUpdateService.instance.check();
+  }
 
   @override
   void dispose() {
@@ -134,16 +142,46 @@ class _HomeScreenState extends State<HomeScreen> {
                           ],
                         ),
                       ),
-                      IconButton(
-                        tooltip: 'Pengaturan API key',
-                        onPressed: () => Navigator.of(context).push(
-                          MaterialPageRoute(
-                            builder: (_) => const SettingsScreen(),
-                          ),
-                        ),
-                        icon: const Icon(Icons.settings_rounded),
+                      ValueListenableBuilder(
+                        valueListenable: AppUpdateService.instance.available,
+                        builder: (context, update, _) {
+                          return IconButton(
+                            tooltip: 'Pengaturan',
+                            onPressed: () => Navigator.of(context).push(
+                              MaterialPageRoute(
+                                builder: (_) => const SettingsScreen(),
+                              ),
+                            ),
+                            icon: Badge(
+                              isLabelVisible: update != null,
+                              child: const Icon(Icons.settings_rounded),
+                            ),
+                          );
+                        },
                       ),
                     ],
+                  ),
+                  ValueListenableBuilder(
+                    valueListenable: AppUpdateService.instance.available,
+                    builder: (context, update, _) {
+                      if (update == null) return const SizedBox.shrink();
+                      return Padding(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: Material(
+                          color: AppColors.accentLight.withValues(alpha: 0.45),
+                          borderRadius: BorderRadius.circular(12),
+                          child: ListTile(
+                            dense: true,
+                            leading: const Icon(Icons.system_update_alt_rounded),
+                            title: Text('Update v${update.version} tersedia'),
+                            trailing: FilledButton(
+                              onPressed: () => startAppUpdate(context),
+                              child: const Text('Update'),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
                   ),
                   const SizedBox(height: 16),
                   Row(

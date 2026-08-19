@@ -43,3 +43,7 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Local GitHub release upload leftovers
+/latest.json
+/yt-downloader.apk

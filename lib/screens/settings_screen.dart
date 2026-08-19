@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../services/api_keys_service.dart';
+import '../services/app_update_service.dart';
 import '../theme/app_theme.dart';
+import '../widgets/update_dialog.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -123,6 +125,61 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     backgroundColor: AppColors.primary,
                   ),
                   child: Text(_saving ? 'Menyimpan...' : 'Simpan'),
+                ),
+                const SizedBox(height: 32),
+                ValueListenableBuilder(
+                  valueListenable: AppUpdateService.instance.available,
+                  builder: (context, update, _) {
+                    final current = AppUpdateService.instance.currentVersion;
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Aplikasi',
+                          style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          current.isEmpty
+                              ? 'Versi terpasang'
+                              : 'Versi terpasang: $current',
+                          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                            color: Theme.of(context).colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        if (update != null)
+                          FilledButton.icon(
+                            onPressed: () => startAppUpdate(context),
+                            icon: const Icon(Icons.system_update_alt_rounded),
+                            label: Text('Update ke v${update.version}'),
+                            style: FilledButton.styleFrom(
+                              minimumSize: const Size.fromHeight(48),
+                              backgroundColor: AppColors.primary,
+                            ),
+                          )
+                        else
+                          OutlinedButton(
+                            onPressed: () async {
+                              final found = await AppUpdateService.instance.check();
+                              if (!context.mounted) return;
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    found == null
+                                        ? 'Sudah versi terbaru'
+                                        : 'Update v${found.version} tersedia',
+                                  ),
+                                ),
+                              );
+                            },
+                            child: const Text('Cek update'),
+                          ),
+                      ],
+                    );
+                  },
                 ),
               ],
             ),

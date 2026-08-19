@@ -5,6 +5,7 @@ import android.content.ClipData
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.provider.Settings
 import android.util.Log
 import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
@@ -14,10 +15,31 @@ import java.io.File
 
 class MainActivity : FlutterActivity() {
     private val channelName = "yt_downloader/klippod"
+    private val updaterChannelName = "yt_downloader/updater"
     private val tag = "KlippodOpen"
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, updaterChannelName)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "installApk" -> {
+                        val path = call.argument<String>("path")
+                        if (path.isNullOrBlank()) {
+                            result.error("bad_args", "path required", null)
+                            return@setMethodCallHandler
+                        }
+                        try {
+                            result.success(installApk(path))
+                        } catch (e: Exception) {
+                            Log.e(tag, "installApk failed", e)
+                            result.error("install_failed", e.message ?: e.toString(), null)
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
             .setMethodCallHandler { call, result ->
@@ -82,6 +104,40 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    private fun installApk(path: String): String {
+        val file = File(path)
+        if (!file.exists()) {
+            throw IllegalStateException("APK tidak ditemukan: $path")
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            !packageManager.canRequestPackageInstalls()
+        ) {
+            startActivity(
+                Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
+                    data = Uri.parse("package:$packageName")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                },
+            )
+            return "need_permission"
+        }
+
+        val uri = FileProvider.getUriForFile(
+            this,
+            "${applicationContext.packageName}.fileprovider",
+            file,
+        )
+        startActivity(
+            Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            },
+        )
+        return "ok"
     }
 
     private fun isPackageInstalled(packageName: String): Boolean {
