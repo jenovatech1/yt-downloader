@@ -1,0 +1,93 @@
+# Prompt untuk Cursor — App Klippod (integrasi dari YT Downloader)
+
+Copy-paste teks di bawah ini ke chat Cursor di project **Klippod**.
+
+---
+
+## Tugas
+
+Tambahkan kemampuan Klippod untuk **menerima video dari app YT Downloader** setelah user menekan tombol **"Buka di Klippod"**.
+
+YT Downloader sudah mengirim video dengan cara berikut (jangan diubah di sisi downloader kecuali package name beda):
+
+### Kontrak integrasi (sudah diimplementasi di YT Downloader)
+
+1. **Package name target:** `com.jenovatech.klippod`  
+   - Harus sama dengan `applicationId` Klippod di Play Store / `android/app/build.gradle`.
+
+2. **Deep link (prioritas utama):**
+   - Scheme: `klippod`
+   - URI: `klippod://import`
+   - Intent action: `ACTION_VIEW`
+   - Extra:
+     - `android.intent.extra.STREAM` → `content://...` (URI video, grant read)
+     - `video_uri` (String) → URI yang sama
+     - `android.intent.extra.TITLE` → judul video
+     - `source` = `"yt_downloader"`
+
+3. **Fallback intents (juga dukung):**
+   - `ACTION_SEND` + `type=video/mp4` + `EXTRA_STREAM` (content URI)
+   - `ACTION_VIEW` + `data=content://...` + `type=video/mp4`
+
+4. Video dikirim lewat **FileProvider content URI** (bukan path file mentah). Harus bisa baca dengan `FLAG_GRANT_READ_URI_PERMISSION`.
+
+### Yang harus dilakukan di Klippod
+
+1. **AndroidManifest.xml**
+   - Tambahkan intent-filter di Activity utama (atau activity import) yang `exported="true"`:
+
+```xml
+<!-- Deep link dari YT Downloader -->
+<intent-filter>
+    <action android:name="android.intent.action.VIEW" />
+    <category android:name="android.intent.category.DEFAULT" />
+    <category android:name="android.intent.category.BROWSABLE" />
+    <data android:scheme="klippod" android:host="import" />
+</intent-filter>
+
+<!-- Share / send video -->
+<intent-filter>
+    <action android:name="android.intent.action.SEND" />
+    <category android:name="android.intent.category.DEFAULT" />
+    <data android:mimeType="video/*" />
+</intent-filter>
+
+<!-- Open video directly -->
+<intent-filter>
+    <action android:name="android.intent.action.VIEW" />
+    <category android:name="android.intent.category.DEFAULT" />
+    <data android:mimeType="video/*" />
+</intent-filter>
+```
+
+2. **Di Flutter (atau native) handle incoming intent**
+   - Saat app dibuka / resumed dari intent:
+     - Ambil `Uri` dari:
+       1. `intent.data` (kalau VIEW file)
+       2. `intent.extra[EXTRA_STREAM]`
+       3. `intent.extra["video_uri"]` (String → parse Uri)
+     - Copy / import file dari content URI ke storage internal Klippod (pakai `ContentResolver.openInputStream`)
+     - Langsung buka layar editor/klip dengan video itu sudah ter-load (auto-import, jangan minta user pilih file lagi)
+
+3. **Package yang berguna (opsional):**
+   - `receive_sharing_intent` atau handle sendiri via `MethodChannel` + `getIntent()` di `MainActivity`
+   - Pastikan juga handle `onNewIntent` kalau `launchMode` singleTop/singleTask
+
+4. **UX yang diharapkan**
+   - User selesai download di YT Downloader → tap **Buka di Klippod**
+   - Klippod terbuka → video **langsung masuk project/editor** siap di-klip
+   - Kalau intent tidak valid, tampilkan error yang jelas
+
+5. **Jangan ubah** fitur inti Klippod yang sudah ada, fokus hanya integrasi import video dari intent.
+
+6. Setelah selesai, beritahu package name final Klippod (`applicationId`) supaya bisa diselaraskan di YT Downloader jika perlu.
+
+---
+
+## Catatan testing
+
+1. Install APK YT Downloader + Klippod (debug/release) di HP yang sama.
+2. Download 1 video di YT Downloader.
+3. Tap **Buka di Klippod**.
+4. Pastikan Klippod terbuka dan video langsung ter-import.
+5. Uninstall Klippod → tap tombol lagi → harus muncul ajakan install Play Store.
