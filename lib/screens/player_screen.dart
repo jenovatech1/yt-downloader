@@ -243,12 +243,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
 
     final player = _controller;
-    if (player != null && player.value.isInitialized && player.value.isPlaying) {
+    if (player != null && player.value.isInitialized) {
       await player.pause();
     }
 
     try {
-      final result = await ClipPipeline(_youtube).run(
+      final result = await ClipPipeline().run(
         video: widget.video,
         option: option,
         onProgress: (progress) {

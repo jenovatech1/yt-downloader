@@ -26,9 +26,8 @@ class ClipPipelineResult {
 }
 
 class ClipPipeline {
-  ClipPipeline(this._youtube);
+  ClipPipeline();
 
-  final YoutubeService _youtube;
   final _ai = ClipAiService();
 
   Future<ClipPipelineResult> run({
@@ -42,28 +41,47 @@ class ClipPipeline {
       throw Exception('Isi API key Groq atau Gemini di Pengaturan dulu.');
     }
 
-    void emit(String phase, double progress) {
+    var lastBytes = 0;
+    var lastTick = DateTime.now();
+    var speed = 0.0;
+
+    void emit(
+      String phase,
+      double progress, {
+      int downloaded = 0,
+      int total = 0,
+    }) {
+      final now = DateTime.now();
+      final elapsed = now.difference(lastTick).inMilliseconds;
+      if (elapsed >= 400 && downloaded >= lastBytes) {
+        speed = ((downloaded - lastBytes) * 1000) / elapsed;
+        lastTick = now;
+        lastBytes = downloaded;
+      }
       onProgress(
         DownloadProgress(
           phase: phase,
           progress: progress.clamp(0, 1),
-          downloadedBytes: 0,
-          totalBytes: 0,
-          speedBytesPerSecond: 0,
+          downloadedBytes: downloaded,
+          totalBytes: total,
+          speedBytesPerSecond: speed,
         ),
       );
     }
 
+    final yt = YoutubeService();
+    try {
     emit('Menyiapkan audio (${option.label})...', 0.02);
-    final manifest = await _youtube.getManifest(video.id.value);
-    final audioInfo = option.audioOnly ?? _youtube.bestAudio(manifest);
-    final videoUrl = option.videoOnly?.url.toString() ??
-        option.muxed?.url.toString();
+    final manifest = await yt.getManifest(video.id.value);
+    final audioInfo = yt.compactAudio(manifest) ?? yt.bestAudio(manifest);
+    final videoOnly = yt.videoOnlyAt(manifest, option.height) ?? option.videoOnly;
+    final muxed = yt.muxedAt(manifest, option.height) ?? option.muxed;
+    final videoUrl = videoOnly?.url.toString() ?? muxed?.url.toString();
     if (audioInfo == null || videoUrl == null) {
       throw Exception('Stream ${option.label} tidak tersedia untuk klip.');
     }
     final audioUrl = audioInfo.url.toString();
-    final muxedOnly = option.muxed != null && option.videoOnly == null;
+    final muxedOnly = videoOnly == null && muxed != null;
 
     final docs = await getApplicationDocumentsDirectory();
     final workDir = Directory(
@@ -78,11 +96,43 @@ class ClipPipeline {
       workDir.path,
       'audio.${audioInfo.container.name}',
     );
-    emit('Mengunduh audio...', 0.08);
-    await _downloadStream(audioInfo, rawAudio, (received, total) {
-      final frac = total <= 0 ? 0.0 : received / total;
-      emit('Mengunduh audio...', 0.08 + 0.22 * frac);
-    });
+    emit(
+      'Mengunduh audio...',
+      0.08,
+      total: audioInfo.size.totalBytes,
+    );
+
+    Object? lastError;
+    var downloaded = false;
+    for (var attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await yt.downloadToFile(audioInfo, rawAudio, onBytes: (received, total) {
+          final frac = total <= 0 ? 0.0 : received / total;
+          emit(
+            'Mengunduh audio...',
+            0.08 + 0.22 * frac,
+            downloaded: received,
+            total: total,
+          );
+        });
+        downloaded = true;
+        break;
+      } catch (e) {
+        lastError = e;
+        try {
+          await File(rawAudio).delete();
+        } catch (_) {}
+        if (attempt == 1) {
+          emit('Mengunduh audio (ulang)...', 0.08, total: audioInfo.size.totalBytes);
+          await Future<void>.delayed(const Duration(milliseconds: 600));
+        }
+      }
+    }
+    if (!downloaded) {
+      throw Exception(
+        'Gagal mengunduh audio. Coba pause dulu / ganti jaringan.\n$lastError',
+      );
+    }
 
     emit('Kompres audio...', 0.32);
     final smallAudio = p.join(workDir.path, 'audio_small.m4a');
@@ -130,7 +180,7 @@ class ClipPipeline {
         'clip_${i.toString().padLeft(2, '0')}.mp4',
       );
       await _cutSegment(
-        videoUrl: muxedOnly ? option.muxed!.url.toString() : videoUrl,
+        videoUrl: muxedOnly ? muxed.url.toString() : videoUrl,
         audioUrl: audioUrl,
         startSec: start,
         durationSec: dur,
@@ -171,26 +221,8 @@ class ClipPipeline {
       youtubeUrl: youtubeUrl,
       sourceTitle: video.title,
     );
-  }
-
-  Future<void> _downloadStream(
-    StreamInfo info,
-    String path,
-    void Function(int received, int total) onBytes,
-  ) async {
-    final file = File(path);
-    final sink = file.openWrite();
-    final total = info.size.totalBytes;
-    var received = 0;
-    try {
-      await for (final chunk in _youtube.openStream(info)) {
-        sink.add(chunk);
-        received += chunk.length;
-        onBytes(received, total);
-      }
-      await sink.flush();
     } finally {
-      await sink.close();
+      yt.dispose();
     }
   }
 

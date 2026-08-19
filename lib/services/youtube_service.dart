@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
 import '../models/download_option.dart';
@@ -171,6 +174,66 @@ class YoutubeService {
 
   AudioOnlyStreamInfo? bestAudio(StreamManifest manifest) =>
       _bestAudio(manifest);
+
+  /// Audio kecil untuk transkrip (lebih cepat, lolos limit Groq).
+  AudioOnlyStreamInfo? compactAudio(StreamManifest manifest) {
+    final m4a = manifest.audioOnly.where((s) {
+      final n = s.container.name.toLowerCase();
+      return n.contains('mp4') || n.contains('m4a');
+    }).toList()
+      ..sort((a, b) => a.bitrate.compareTo(b.bitrate));
+    if (m4a.isNotEmpty) return m4a.first;
+    final rest = manifest.audioOnly.toList()
+      ..sort((a, b) => a.bitrate.compareTo(b.bitrate));
+    return rest.isEmpty ? null : rest.first;
+  }
+
+  VideoOnlyStreamInfo? videoOnlyAt(StreamManifest manifest, int height) =>
+      _bestVideoOnlyAt(manifest, height);
+
+  MuxedStreamInfo? muxedAt(StreamManifest manifest, int height) =>
+      _bestMuxedAt(manifest, height);
+
+  Future<void> downloadToFile(
+    StreamInfo info,
+    String path, {
+    required void Function(int received, int total) onBytes,
+  }) async {
+    final file = File(path);
+    final sink = file.openWrite(mode: FileMode.writeOnly);
+    final total = info.size.totalBytes;
+    var received = 0;
+    StreamIterator<List<int>>? iterator;
+    try {
+      final stream = _yt.videos.streamsClient.get(info);
+      iterator = StreamIterator(stream);
+      final hasFirst = await iterator.moveNext().timeout(
+        const Duration(seconds: 20),
+        onTimeout: () => throw TimeoutException(
+          'YouTube tidak mengirim audio (timeout 20s)',
+        ),
+      );
+      if (!hasFirst) {
+        throw Exception('Stream audio kosong');
+      }
+      sink.add(iterator.current);
+      received += iterator.current.length;
+      onBytes(received, total <= 0 ? received : total);
+
+      while (await iterator.moveNext()) {
+        sink.add(iterator.current);
+        received += iterator.current.length;
+        onBytes(received, total <= 0 ? received : total);
+      }
+      await sink.flush();
+      if (received < 2048) {
+        throw Exception('File audio terlalu kecil ($received byte)');
+      }
+    } finally {
+      await iterator?.cancel();
+      await sink.close();
+    }
+  }
 
   /// Stream video ringan untuk potongan hook (utamakan mp4 ≤720p).
   VideoOnlyStreamInfo? bestClipVideo(StreamManifest manifest) {
