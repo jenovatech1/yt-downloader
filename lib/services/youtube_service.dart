@@ -47,15 +47,28 @@ class YoutubeService {
     return _yt.videos.get(idOrUrl);
   }
 
-  Future<StreamManifest> getManifest(String videoId) {
-    return _yt.videos.streamsClient.getManifest(
-      videoId,
-      ytClients: [
-        YoutubeApiClient.androidVr,
-        YoutubeApiClient.android,
-        YoutubeApiClient.tv,
-      ],
-    );
+  Future<StreamManifest> getManifest(String videoId) async {
+    // ANDROID (dengan sdkVersion) sering 403/fatal. Jangan dipakai.
+    const clients = [
+      YoutubeApiClient.androidSdkless,
+      YoutubeApiClient.ios,
+      YoutubeApiClient.safari,
+      YoutubeApiClient.androidVr,
+      YoutubeApiClient.tv,
+    ];
+    Object? lastError;
+    for (final client in clients) {
+      try {
+        return await _yt.videos.streamsClient.getManifest(
+          videoId,
+          ytClients: [client],
+        );
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    throw lastError ??
+        Exception('Tidak ada stream YouTube yang bisa dipakai.');
   }
 
   Future<String?> getPlayableUrl(String videoId) async {
@@ -274,5 +287,16 @@ class YoutubeService {
 
   void dispose() {
     _yt.close();
+  }
+
+  static String shortError(Object e) {
+    final s = e.toString();
+    if (s.contains('fatal failure') ||
+        s.contains('FatalFailure') ||
+        s.contains('YouTube most likely changed')) {
+      return 'YouTube memblokir stream (client lama). Update app lalu coba lagi.';
+    }
+    if (s.length > 180) return '${s.substring(0, 180)}…';
+    return s;
   }
 }

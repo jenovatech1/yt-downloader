@@ -118,7 +118,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (!mounted) return;
       setState(() {
         _loadingPlayer = false;
-        _playerError = 'Gagal memutar video: $e';
+        _playerError = 'Gagal memutar video: ${YoutubeService.shortError(e)}';
       });
     }
   }
@@ -140,7 +140,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (!mounted) return;
       setState(() {
         _loadingOptions = false;
-        _optionsError = 'Gagal memuat kualitas: $e';
+        _optionsError = 'Gagal memuat kualitas: ${YoutubeService.shortError(e)}';
       });
     }
   }
@@ -274,7 +274,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       setState(() => _clipping = false);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Get Clip gagal: $e'),
+          content: Text('Get Clip gagal: ${YoutubeService.shortError(e)}'),
           backgroundColor: Theme.of(context).colorScheme.error,
         ),
       );

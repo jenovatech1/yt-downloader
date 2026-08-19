@@ -67,7 +67,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       setState(() {
         _loading = false;
-        _error = 'Gagal mencari: $e';
+        _error = 'Gagal mencari: ${YoutubeService.shortError(e)}';
       });
     }
   }
