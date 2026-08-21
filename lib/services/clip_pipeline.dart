@@ -73,7 +73,8 @@ class ClipPipeline {
     try {
     emit('Menyiapkan audio (${option.label})...', 0.02);
     final manifest = await yt.getManifest(video.id.value);
-    final audioInfo = yt.bestAudio(manifest) ?? yt.compactAudio(manifest);
+    // Audio kecil dulu — Get Clip cuma butuh buat transkrip, bukan kualitas tinggi.
+    final audioInfo = yt.compactAudio(manifest) ?? yt.bestAudio(manifest);
     final videoOnly = yt.videoOnlyAt(manifest, option.height) ?? option.videoOnly;
     final muxed = yt.muxedAt(manifest, option.height) ?? option.muxed;
     final videoUrl = videoOnly?.url.toString() ?? muxed?.url.toString();
@@ -96,6 +97,7 @@ class ClipPipeline {
       workDir.path,
       'audio.${audioInfo.container.name}',
     );
+    final smallAudio = p.join(workDir.path, 'audio_small.m4a');
     emit(
       'Mengunduh audio...',
       0.08,
@@ -128,27 +130,64 @@ class ClipPipeline {
           emit('Mengunduh audio (ulang)...', 0.08);
           try {
             final again = await yt.getManifest(video.id.value);
-            audio = yt.bestAudio(again) ?? audio;
+            audio = yt.compactAudio(again) ?? yt.bestAudio(again) ?? audio;
             audioPath =
                 p.join(workDir.path, 'audio.${audio.container.name}');
           } catch (_) {}
         }
       }
     }
+
+    // Fallback terakhir: FFmpeg tarik langsung dari CDN URL (sering jalan di HP).
+    if (!downloaded) {
+      emit('Mengunduh audio via FFmpeg...', 0.12);
+      try {
+        await _ffmpeg(
+          [
+            '-y',
+            '-i', audio.url.toString(),
+            '-c:a', 'aac',
+            '-b:a', '64k',
+            '-ac', '1',
+            smallAudio,
+          ],
+          fallback: [
+            '-y',
+            '-i', audio.url.toString(),
+            '-c:a', 'aac',
+            '-b:a', '64k',
+            smallAudio,
+          ],
+        );
+        if (await File(smallAudio).exists() &&
+            await File(smallAudio).length() > 2048) {
+          downloaded = true;
+          audioPath = smallAudio;
+        }
+      } catch (e) {
+        lastError = e;
+      }
+    }
+
     if (!downloaded) {
       throw Exception(
         'Gagal mengunduh audio. Coba pause dulu / ganti jaringan.\n$lastError',
       );
     }
 
-    emit('Kompres audio...', 0.32);
-    final smallAudio = p.join(workDir.path, 'audio_small.m4a');
-    await _ffmpeg(
-      ['-y', '-i', audioPath, '-c:a', 'aac', '-b:a', '64k', '-ac', '1', smallAudio],
-      fallback: ['-y', '-i', audioPath, '-c:a', 'aac', '-b:a', '64k', smallAudio],
-    );
-    final transcribeFile =
-        await File(smallAudio).exists() ? File(smallAudio) : File(audioPath);
+    File transcribeFile;
+    if (audioPath == smallAudio) {
+      emit('Audio siap...', 0.32);
+      transcribeFile = File(smallAudio);
+    } else {
+      emit('Kompres audio...', 0.32);
+      await _ffmpeg(
+        ['-y', '-i', audioPath, '-c:a', 'aac', '-b:a', '64k', '-ac', '1', smallAudio],
+        fallback: ['-y', '-i', audioPath, '-c:a', 'aac', '-b:a', '64k', smallAudio],
+      );
+      transcribeFile =
+          await File(smallAudio).exists() ? File(smallAudio) : File(audioPath);
+    }
 
     emit('Transkrip audio (AI)...', 0.40);
     final transcript = await _ai.transcribe(
