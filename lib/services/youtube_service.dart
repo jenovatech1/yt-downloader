@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -10,17 +9,10 @@ import '../models/download_option.dart';
 class YoutubeService {
   YoutubeService() : _yt = YoutubeExplode();
 
-  YoutubeExplode _yt;
+  final YoutubeExplode _yt;
   final _http = http.Client();
 
   static const _placeholderChannel = 'UCXXXXXXXXXXXXXXXXXXXXXX';
-
-  void _resetClient() {
-    try {
-      _yt.close();
-    } catch (_) {}
-    _yt = YoutubeExplode();
-  }
 
   bool looksLikeUrl(String input) {
     final trimmed = input.trim();
@@ -47,90 +39,51 @@ class YoutubeService {
 
     final videoId = tryParseVideoId(trimmed);
     if (videoId != null) {
-      return [await getVideo(videoId)];
+      final video = await _yt.videos.get(videoId);
+      return [video];
     }
 
-    Object? lastError;
-
-    // Innertube dulu — di Android HTML scrape sering 400/fatal.
+    // Innertube dulu (lebih stabil di Android), fallback ke library.
     try {
       final innertube = await _searchInnertube(trimmed);
       if (innertube.isNotEmpty) return innertube;
-    } catch (e) {
-      lastError = e;
-    }
+    } catch (_) {}
 
-    try {
-      final results = await _yt.search.search(trimmed).timeout(
-            const Duration(seconds: 20),
-          );
-      final list = results.take(30).toList();
-      if (list.isNotEmpty) return list;
-    } catch (e) {
-      lastError = e;
-      _resetClient();
-    }
-
-    throw lastError ?? Exception('Tidak ada hasil pencarian.');
+    final results = await _yt.search.search(trimmed);
+    return results.take(30).toList();
   }
 
   Future<List<Video>> _searchInnertube(String query) async {
-    final attempts = [
-      {
-        'clientName': 'WEB',
-        'clientVersion': '2.20250312.04.00',
-        'userAgent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      },
-      {
-        'clientName': 'ANDROID',
-        'clientVersion': '20.10.38',
-        'userAgent':
-            'com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip',
-      },
-    ];
-
-    Object? lastError;
-    for (final client in attempts) {
-      try {
-        final uri = Uri.parse(
-          'https://www.youtube.com/youtubei/v1/search?prettyPrint=false',
-        );
-        final response = await _http
-            .post(
-              uri,
-              headers: {
-                'Content-Type': 'application/json',
-                'User-Agent': client['userAgent']!,
-                'Accept-Language': 'en-US,en;q=0.9',
+    final uri = Uri.parse(
+      'https://www.youtube.com/youtubei/v1/search?prettyPrint=false',
+    );
+    final response = await _http
+        .post(
+          uri,
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+          },
+          body: jsonEncode({
+            'context': {
+              'client': {
+                'clientName': 'WEB',
+                'clientVersion': '2.20250312.04.00',
+                'hl': 'en',
+                'gl': 'US',
               },
-              body: jsonEncode({
-                'context': {
-                  'client': {
-                    'clientName': client['clientName'],
-                    'clientVersion': client['clientVersion'],
-                    'hl': 'en',
-                    'gl': 'US',
-                  },
-                },
-                'query': query,
-              }),
-            )
-            .timeout(const Duration(seconds: 20));
+            },
+            'query': query,
+          }),
+        )
+        .timeout(const Duration(seconds: 20));
 
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          throw Exception(
-            'Innertube search ${response.statusCode}',
-          );
-        }
-
-        final videos = _parseInnertubeSearch(response.body);
-        if (videos.isNotEmpty) return videos;
-      } catch (e) {
-        lastError = e;
-      }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Innertube search ${response.statusCode}');
     }
-    throw lastError ?? Exception('Innertube search kosong');
+    return _parseInnertubeSearch(response.body);
   }
 
   List<Video> _parseInnertubeSearch(String body) {
@@ -146,12 +99,9 @@ class YoutubeService {
         if (renderer is Map) {
           final id = renderer['videoId']?.toString();
           if (id != null && id.length == 11 && seen.add(id)) {
-            final title = _runsText(renderer['title']) ??
-                _runsText(renderer['headline']) ??
-                'Video';
+            final title = _runsText(renderer['title']) ?? 'Video';
             final author = _runsText(renderer['ownerText']) ??
                 _runsText(renderer['shortBylineText']) ??
-                _runsText(renderer['longBylineText']) ??
                 'YouTube';
             final channelId = _channelIdFrom(renderer) ?? _placeholderChannel;
             final duration = _parseDurationLabel(
@@ -210,13 +160,11 @@ class YoutubeService {
   }
 
   String? _channelIdFrom(Map renderer) {
-    final candidates = <dynamic>[
+    for (final candidate in [
       renderer['ownerText'],
       renderer['shortBylineText'],
       renderer['longBylineText'],
-      renderer['channelThumbnailSupportedRenderers'],
-    ];
-    for (final candidate in candidates) {
+    ]) {
       final found = _findChannelId(candidate);
       if (found != null) return found;
     }
@@ -251,59 +199,24 @@ class YoutubeService {
     if (nums.length == 2) {
       return Duration(minutes: nums[0], seconds: nums[1]);
     }
-    if (nums.length == 1) {
-      return Duration(seconds: nums[0]);
-    }
+    if (nums.length == 1) return Duration(seconds: nums[0]);
     return null;
   }
 
-  Future<Video> getVideo(String idOrUrl) async {
-    try {
-      return await _yt.videos.get(idOrUrl).timeout(const Duration(seconds: 20));
-    } catch (_) {
-      _resetClient();
-      final id = tryParseVideoId(idOrUrl) ?? idOrUrl;
-      // Fallback ringan kalau watch page gagal — cukup buat buka player.
-      return Video(
-        VideoId(id),
-        'YouTube video',
-        'YouTube',
-        ChannelId(_placeholderChannel),
-        null,
-        null,
-        null,
-        '',
-        null,
-        ThumbnailSet(id),
-        const [],
-        const Engagement(0, null, null),
-        false,
-      );
-    }
+  Future<Video> getVideo(String idOrUrl) {
+    return _yt.videos.get(idOrUrl);
   }
 
-  Future<StreamManifest> getManifest(String videoId) async {
-    // ANDROID (sdkVersion) = 403 fatal. androidSdkless sering hang di HEAD.
-    // androidVr dulu yang bikin Download jalan.
-    final attempts = <List<YoutubeApiClient>>[
-      [YoutubeApiClient.androidVr],
-      [YoutubeApiClient.ios],
-      [YoutubeApiClient.tv],
-      [YoutubeApiClient.safari],
-    ];
-    Object? lastError;
-    for (final clients in attempts) {
-      try {
-        return await _yt.videos.streamsClient
-            .getManifest(videoId, ytClients: clients)
-            .timeout(const Duration(seconds: 12));
-      } catch (e) {
-        lastError = e;
-        _resetClient();
-      }
-    }
-    throw lastError ??
-        Exception('Tidak ada stream YouTube yang bisa dipakai.');
+  /// Cara lama yang dulu lancar: satu request, merge beberapa client.
+  Future<StreamManifest> getManifest(String videoId) {
+    return _yt.videos.streamsClient.getManifest(
+      videoId,
+      ytClients: [
+        YoutubeApiClient.androidVr,
+        YoutubeApiClient.android,
+        YoutubeApiClient.tv,
+      ],
+    );
   }
 
   Future<String?> getPlayableUrl(String videoId) async {
@@ -338,7 +251,6 @@ class YoutubeService {
     final options = <DownloadOption>[];
     final usedHeights = <int>{};
 
-    // Semua resolusi unik dari muxed + video-only.
     final heights = <int>{
       ...manifest.muxed.map((s) => s.videoResolution.height),
       ...manifest.videoOnly.map((s) => s.videoResolution.height),
@@ -422,7 +334,6 @@ class YoutubeService {
   AudioOnlyStreamInfo? bestAudio(StreamManifest manifest) =>
       _bestAudio(manifest);
 
-  /// Audio kecil untuk transkrip (lebih cepat, lolos limit Groq).
   AudioOnlyStreamInfo? compactAudio(StreamManifest manifest) {
     final m4a = manifest.audioOnly.where((s) {
       final n = s.container.name.toLowerCase();
@@ -441,6 +352,7 @@ class YoutubeService {
   MuxedStreamInfo? muxedAt(StreamManifest manifest, int height) =>
       _bestMuxedAt(manifest, height);
 
+  /// Dipakai Get Clip saja. Download biasa tetap via [openStream].
   Future<void> downloadToFile(
     StreamInfo info,
     String path, {
@@ -450,64 +362,19 @@ class YoutubeService {
     final sink = file.openWrite(mode: FileMode.writeOnly);
     final total = info.size.totalBytes;
     var received = 0;
-    StreamIterator<List<int>>? iterator;
     try {
-      final stream = _yt.videos.streamsClient.get(info);
-      iterator = StreamIterator(stream);
-      final hasFirst = await iterator.moveNext().timeout(
-        const Duration(seconds: 12),
-        onTimeout: () => throw TimeoutException(
-          'YouTube tidak mengirim data (timeout 12s)',
-        ),
-      );
-      if (!hasFirst) {
-        throw Exception('Stream audio kosong');
-      }
-      sink.add(iterator.current);
-      received += iterator.current.length;
-      onBytes(received, total <= 0 ? received : total);
-
-      while (await iterator.moveNext()) {
-        sink.add(iterator.current);
-        received += iterator.current.length;
+      await for (final chunk in openStream(info)) {
+        sink.add(chunk);
+        received += chunk.length;
         onBytes(received, total <= 0 ? received : total);
       }
       await sink.flush();
       if (received < 2048) {
-        throw Exception('File audio terlalu kecil ($received byte)');
+        throw Exception('File terlalu kecil ($received byte)');
       }
-    } catch (e) {
-      _resetClient();
-      try {
-        if (await file.exists()) await file.delete();
-      } catch (_) {}
-      rethrow;
     } finally {
-      try {
-        await iterator?.cancel();
-      } catch (_) {}
-      try {
-        await sink.close();
-      } catch (_) {}
+      await sink.close();
     }
-  }
-
-  /// Stream video ringan untuk potongan hook (utamakan mp4 ≤720p).
-  VideoOnlyStreamInfo? bestClipVideo(StreamManifest manifest) {
-    const preferred = [720, 480, 360, 540, 1080];
-    for (final height in preferred) {
-      final match = _bestVideoOnlyAt(manifest, height);
-      if (match != null) return match;
-    }
-    final rest = manifest.videoOnly.toList()
-      ..sort((a, b) {
-        final byHeight =
-            a.videoResolution.height.compareTo(b.videoResolution.height);
-        if (byHeight != 0) return byHeight;
-        return _containerScore(b.container.name) -
-            _containerScore(a.container.name);
-      });
-    return rest.isEmpty ? null : rest.first;
   }
 
   AudioOnlyStreamInfo? _bestAudio(StreamManifest manifest) {
@@ -521,7 +388,6 @@ class YoutubeService {
     return candidates.isEmpty ? null : candidates.first;
   }
 
-  // Prefer mp4/m4a so the minimal FFmpeg build can mux with stream copy.
   int _containerScore(String name) {
     final lower = name.toLowerCase();
     if (lower.contains('mp4') || lower.contains('m4a')) return 2;
@@ -530,9 +396,7 @@ class YoutubeService {
   }
 
   void dispose() {
-    try {
-      _yt.close();
-    } catch (_) {}
+    _yt.close();
     _http.close();
   }
 
@@ -541,7 +405,7 @@ class YoutubeService {
     if (s.contains('fatal failure') ||
         s.contains('FatalFailure') ||
         s.contains('YouTube most likely changed')) {
-      return 'YouTube memblokir request. Coba link video langsung, atau update app.';
+      return 'YouTube memblokir request. Coba lagi / update app.';
     }
     if (s.length > 180) return '${s.substring(0, 180)}…';
     return s;

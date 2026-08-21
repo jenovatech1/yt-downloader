@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:io';
 
 import 'package:ffmpeg_kit_flutter_new_min/ffmpeg_kit.dart';
@@ -179,22 +179,28 @@ class DownloadService {
     String path, {
     required void Function(int received) onBytes,
   }) async {
+    final file = File(path);
+    final sink = file.openWrite(mode: FileMode.writeOnly);
+    final total = info.size.totalBytes;
     var received = 0;
     var pendingEmit = 0;
-    await _youtube.downloadToFile(
-      info,
-      path,
-      onBytes: (got, _) {
-        received = got;
-        pendingEmit += 256 * 1024;
-        if (pendingEmit >= 1024 * 1024 ||
-            (info.size.totalBytes > 0 && received >= info.size.totalBytes)) {
+
+    try {
+      await for (final chunk in _youtube.openStream(info)) {
+        sink.add(chunk);
+        received += chunk.length;
+        pendingEmit += chunk.length;
+
+        if (pendingEmit >= 1024 * 1024 || (total > 0 && received >= total)) {
           pendingEmit = 0;
           onBytes(received);
         }
-      },
-    );
-    onBytes(received);
+      }
+      await sink.flush();
+      onBytes(received);
+    } finally {
+      await sink.close();
+    }
   }
 
   Future<void> _merge(
