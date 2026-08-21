@@ -145,6 +145,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
+  Future<void> _releasePlayer() async {
+    final player = _controller;
+    _controller = null;
+    if (player == null) return;
+    try {
+      await player.pause();
+    } catch (_) {}
+    try {
+      await player.dispose();
+    } catch (_) {}
+    if (mounted) setState(() {});
+  }
+
   Future<void> _download() async {
     final option = _selected;
     if (option == null || _downloading || _downloadManager.isRunning) return;
@@ -162,18 +175,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
 
     try {
-      // Pause player biar bandwidth penuh ke download.
-      final player = _controller;
-      if (player != null && player.value.isInitialized && player.value.isPlaying) {
-        await player.pause();
-      }
+      // Lepas player total — koneksi googlevideo player sering bikin download hang.
+      await _releasePlayer();
 
       await _downloadManager.startDownload(
         video: widget.video,
         option: option,
       );
 
-      // Auto-open hanya setelah file FINAL siap (video+audio sudah digabung).
       if (!mounted) return;
       setState(() => _downloadDone = true);
       await Future<void>.delayed(const Duration(milliseconds: 350));
@@ -242,10 +251,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       );
     });
 
-    final player = _controller;
-    if (player != null && player.value.isInitialized) {
-      await player.pause();
-    }
+    await _releasePlayer();
 
     try {
       final result = await ClipPipeline().run(

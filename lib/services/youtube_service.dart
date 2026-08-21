@@ -1,11 +1,10 @@
-import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:http/http.dart' as http;
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
 import '../models/download_option.dart';
+import 'stream_downloader.dart';
 
 class YoutubeService {
   YoutubeService() : _yt = YoutubeExplode();
@@ -208,16 +207,33 @@ class YoutubeService {
     return _yt.videos.get(idOrUrl);
   }
 
-  /// Cara lama yang dulu lancar: satu request, merge beberapa client.
+  YoutubeExplode get client => _yt;
+
+  /// Cara stabil: androidVr (bukan ANDROID biasa — sering butuh JS decipher / hang).
   Future<StreamManifest> getManifest(String videoId) {
     return _yt.videos.streamsClient.getManifest(
       videoId,
       ytClients: [
         YoutubeApiClient.androidVr,
-        YoutubeApiClient.android,
+        YoutubeApiClient.mediaConnect,
         YoutubeApiClient.tv,
       ],
     );
+  }
+
+  /// Ambil ulang opsi download dengan URL fresh untuk [height].
+  Future<DownloadOption?> resolveDownloadOption(String videoId, int height) async {
+    final options = await getDownloadOptions(videoId);
+    DownloadOption? exact;
+    DownloadOption? muxedFallback;
+    for (final o in options) {
+      if (o.height == height) {
+        if (o.isMuxed) return o;
+        exact ??= o;
+      }
+      if (o.isMuxed) muxedFallback ??= o;
+    }
+    return exact ?? muxedFallback ?? (options.isEmpty ? null : options.first);
   }
 
   Future<String?> getPlayableUrl(String videoId) async {
@@ -353,127 +369,18 @@ class YoutubeService {
   MuxedStreamInfo? muxedAt(StreamManifest manifest, int height) =>
       _bestMuxedAt(manifest, height);
 
-  /// Dipakai Get Clip saja. Download biasa tetap via [openStream].
-  /// Di Android, stream youtube_explode sering hang → HTTP dulu, lalu fallback.
+  /// Dipakai Get Clip. Download biasa pakai [StreamDownloader] langsung.
   Future<void> downloadToFile(
     StreamInfo info,
     String path, {
     required void Function(int received, int total) onBytes,
-  }) async {
-    Object? lastError;
-    try {
-      await _downloadViaHttp(info.url, path, expectedTotal: info.size.totalBytes, onBytes: onBytes);
-      return;
-    } catch (e) {
-      lastError = e;
-      try {
-        if (await File(path).exists()) await File(path).delete();
-      } catch (_) {}
-    }
-
-    try {
-      await _downloadViaExplode(info, path, onBytes: onBytes);
-      return;
-    } catch (e) {
-      lastError = e;
-      try {
-        if (await File(path).exists()) await File(path).delete();
-      } catch (_) {}
-    }
-
-    throw Exception('Gagal unduh audio: $lastError');
-  }
-
-  Future<void> _downloadViaHttp(
-    Uri url,
-    String path, {
-    required int expectedTotal,
-    required void Function(int received, int total) onBytes,
-  }) async {
-    final client = HttpClient();
-    client.connectionTimeout = const Duration(seconds: 15);
-    client.userAgent =
-        'com.google.android.youtube/19.09.37 (Linux; U; Android 14) gzip';
-    try {
-      final req = await client.getUrl(url);
-      req.headers.set(HttpHeaders.acceptHeader, '*/*');
-      req.headers.set('Accept-Language', 'en-US,en;q=0.9');
-      final res = await req.close().timeout(const Duration(seconds: 20));
-      if (res.statusCode < 200 || res.statusCode >= 300) {
-        throw Exception('HTTP ${res.statusCode}');
-      }
-      final total = res.contentLength > 0 ? res.contentLength : expectedTotal;
-      final file = File(path);
-      final sink = file.openWrite(mode: FileMode.writeOnly);
-      var received = 0;
-      try {
-        await for (final chunk in res.timeout(
-          const Duration(seconds: 20),
-          onTimeout: (sink) {
-            sink.addError(TimeoutException('HTTP audio stall'));
-            sink.close();
-          },
-        )) {
-          sink.add(chunk);
-          received += chunk.length;
-          onBytes(received, total <= 0 ? received : total);
-        }
-        await sink.flush();
-      } finally {
-        await sink.close();
-      }
-      if (received < 2048) {
-        throw Exception('File terlalu kecil ($received byte)');
-      }
-    } finally {
-      client.close(force: true);
-    }
-  }
-
-  Future<void> _downloadViaExplode(
-    StreamInfo info,
-    String path, {
-    required void Function(int received, int total) onBytes,
-  }) async {
-    final file = File(path);
-    final sink = file.openWrite(mode: FileMode.writeOnly);
-    final total = info.size.totalBytes;
-    var received = 0;
-    final iterator = StreamIterator(openStream(info));
-    try {
-      final hasFirst = await iterator.moveNext().timeout(
-        const Duration(seconds: 12),
-        onTimeout: () => throw TimeoutException(
-          'YouTube tidak mengirim data (timeout 12s)',
-        ),
-      );
-      if (!hasFirst) throw Exception('Stream audio kosong');
-
-      Future<void> writeCurrent() async {
-        sink.add(iterator.current);
-        received += iterator.current.length;
-        onBytes(received, total <= 0 ? received : total);
-      }
-
-      await writeCurrent();
-      while (true) {
-        final hasMore = await iterator.moveNext().timeout(
-          const Duration(seconds: 20),
-          onTimeout: () => throw TimeoutException('Audio download stall'),
-        );
-        if (!hasMore) break;
-        await writeCurrent();
-      }
-      await sink.flush();
-      if (received < 2048) {
-        throw Exception('File terlalu kecil ($received byte)');
-      }
-    } finally {
-      try {
-        await iterator.cancel();
-      } catch (_) {}
-      await sink.close();
-    }
+  }) {
+    return StreamDownloader.download(
+      info,
+      path,
+      yt: _yt,
+      onBytes: onBytes,
+    );
   }
 
   AudioOnlyStreamInfo? _bestAudio(StreamManifest manifest) {

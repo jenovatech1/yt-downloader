@@ -73,7 +73,7 @@ class ClipPipeline {
     try {
     emit('Menyiapkan audio (${option.label})...', 0.02);
     final manifest = await yt.getManifest(video.id.value);
-    // Audio kecil dulu — Get Clip cuma butuh buat transkrip, bukan kualitas tinggi.
+    // Audio kecil dulu — Get Clip cuma butuh buat transkrip.
     final audioInfo = yt.compactAudio(manifest) ?? yt.bestAudio(manifest);
     final videoOnly = yt.videoOnlyAt(manifest, option.height) ?? option.videoOnly;
     final muxed = yt.muxedAt(manifest, option.height) ?? option.muxed;
@@ -93,101 +93,126 @@ class ClipPipeline {
     }
     await workDir.create(recursive: true);
 
-    final rawAudio = p.join(
-      workDir.path,
-      'audio.${audioInfo.container.name}',
-    );
     final smallAudio = p.join(workDir.path, 'audio_small.m4a');
-    emit(
-      'Mengunduh audio...',
-      0.08,
-      total: audioInfo.size.totalBytes,
-    );
+    emit('Mengunduh audio...', 0.08, total: audioInfo.size.totalBytes);
 
     Object? lastError;
-    var downloaded = false;
-    var audio = audioInfo;
-    var audioPath = rawAudio;
-    for (var attempt = 1; attempt <= 2; attempt++) {
-      try {
-        await yt.downloadToFile(audio, audioPath, onBytes: (received, total) {
-          final frac = total <= 0 ? 0.0 : received / total;
-          emit(
-            'Mengunduh audio...',
-            0.08 + 0.22 * frac,
-            downloaded: received,
-            total: total,
-          );
-        });
-        downloaded = true;
-        break;
-      } catch (e) {
-        lastError = e;
+    var ready = false;
+
+    // 1) FFmpeg langsung dari CDN (paling sering jalan di HP).
+    try {
+      emit('Mengunduh audio (FFmpeg)...', 0.10);
+      await _ffmpeg(
+        [
+          '-y',
+          '-user_agent',
+          'com.google.android.youtube/19.09.37 (Linux; U; Android 14) gzip',
+          '-i',
+          audioUrl,
+          '-c:a',
+          'aac',
+          '-b:a',
+          '64k',
+          '-ac',
+          '1',
+          smallAudio,
+        ],
+        fallback: [
+          '-y',
+          '-i',
+          audioUrl,
+          '-c:a',
+          'aac',
+          '-b:a',
+          '64k',
+          smallAudio,
+        ],
+      );
+      if (await File(smallAudio).exists() &&
+          await File(smallAudio).length() > 2048) {
+        ready = true;
+      }
+    } catch (e) {
+      lastError = e;
+    }
+
+    // 2) HTTP / explode + kompres.
+    if (!ready) {
+      final rawAudio = p.join(
+        workDir.path,
+        'audio.${audioInfo.container.name}',
+      );
+      for (var attempt = 1; attempt <= 2; attempt++) {
         try {
-          await File(audioPath).delete();
-        } catch (_) {}
-        if (attempt == 1) {
-          emit('Mengunduh audio (ulang)...', 0.08);
-          try {
+          emit(
+            attempt == 1 ? 'Mengunduh audio...' : 'Mengunduh audio (ulang)...',
+            0.08,
+          );
+          var audio = audioInfo;
+          if (attempt == 2) {
             final again = await yt.getManifest(video.id.value);
             audio = yt.compactAudio(again) ?? yt.bestAudio(again) ?? audio;
-            audioPath =
-                p.join(workDir.path, 'audio.${audio.container.name}');
+          }
+          final path = p.join(workDir.path, 'audio.${audio.container.name}');
+          await yt.downloadToFile(audio, path, onBytes: (received, total) {
+            final frac = total <= 0 ? 0.0 : received / total;
+            emit(
+              'Mengunduh audio...',
+              0.08 + 0.20 * frac,
+              downloaded: received,
+              total: total,
+            );
+          });
+          emit('Kompres audio...', 0.30);
+          await _ffmpeg(
+            [
+              '-y',
+              '-i',
+              path,
+              '-c:a',
+              'aac',
+              '-b:a',
+              '64k',
+              '-ac',
+              '1',
+              smallAudio,
+            ],
+            fallback: [
+              '-y',
+              '-i',
+              path,
+              '-c:a',
+              'aac',
+              '-b:a',
+              '64k',
+              smallAudio,
+            ],
+          );
+          if (await File(smallAudio).exists() &&
+              await File(smallAudio).length() > 2048) {
+            ready = true;
+            try {
+              await File(path).delete();
+            } catch (_) {}
+            break;
+          }
+        } catch (e) {
+          lastError = e;
+          try {
+            await File(rawAudio).delete();
           } catch (_) {}
         }
       }
     }
 
-    // Fallback terakhir: FFmpeg tarik langsung dari CDN URL (sering jalan di HP).
-    if (!downloaded) {
-      emit('Mengunduh audio via FFmpeg...', 0.12);
-      try {
-        await _ffmpeg(
-          [
-            '-y',
-            '-i', audio.url.toString(),
-            '-c:a', 'aac',
-            '-b:a', '64k',
-            '-ac', '1',
-            smallAudio,
-          ],
-          fallback: [
-            '-y',
-            '-i', audio.url.toString(),
-            '-c:a', 'aac',
-            '-b:a', '64k',
-            smallAudio,
-          ],
-        );
-        if (await File(smallAudio).exists() &&
-            await File(smallAudio).length() > 2048) {
-          downloaded = true;
-          audioPath = smallAudio;
-        }
-      } catch (e) {
-        lastError = e;
-      }
-    }
-
-    if (!downloaded) {
+    if (!ready) {
       throw Exception(
-        'Gagal mengunduh audio. Coba pause dulu / ganti jaringan.\n$lastError',
+        'Gagal mengunduh audio. Pause video / coba jaringan lain.\n$lastError',
       );
     }
 
-    File transcribeFile;
-    if (audioPath == smallAudio) {
-      emit('Audio siap...', 0.32);
-      transcribeFile = File(smallAudio);
-    } else {
-      emit('Kompres audio...', 0.32);
-      await _ffmpeg(
-        ['-y', '-i', audioPath, '-c:a', 'aac', '-b:a', '64k', '-ac', '1', smallAudio],
-        fallback: ['-y', '-i', audioPath, '-c:a', 'aac', '-b:a', '64k', smallAudio],
-      );
-      transcribeFile =
-          await File(smallAudio).exists() ? File(smallAudio) : File(audioPath);
-    }
+    final transcribeFile = File(smallAudio);
+    emit('Audio siap...', 0.35);
 
     emit('Transkrip audio (AI)...', 0.40);
     final transcript = await _ai.transcribe(
@@ -246,7 +271,6 @@ class ClipPipeline {
     }
 
     try {
-      await File(audioPath).delete();
       if (await File(smallAudio).exists()) await File(smallAudio).delete();
     } catch (_) {}
 
@@ -286,6 +310,8 @@ class ClipPipeline {
       await _ffmpeg(
         [
           '-y',
+          '-user_agent',
+          'com.google.android.youtube/19.09.37 (Linux; U; Android 14) gzip',
           '-ss', ss,
           '-t', t,
           '-i', videoUrl,
@@ -311,6 +337,8 @@ class ClipPipeline {
       await _ffmpeg(
         [
           '-y',
+          '-user_agent',
+          'com.google.android.youtube/19.09.37 (Linux; U; Android 14) gzip',
           '-ss', ss,
           '-t', t,
           '-i', videoUrl,

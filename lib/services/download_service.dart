@@ -1,5 +1,4 @@
-﻿import 'dart:async';
-import 'dart:io';
+﻿import 'dart:io';
 
 import 'package:ffmpeg_kit_flutter_new_min/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_min/return_code.dart';
@@ -10,6 +9,7 @@ import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
 import '../models/download_option.dart';
 import '../models/download_progress.dart';
+import 'stream_downloader.dart';
 import 'youtube_service.dart';
 
 typedef DetailedProgressCallback = void Function(DownloadProgress progress);
@@ -19,8 +19,8 @@ class DownloadService {
 
   final YoutubeService _youtube;
 
-  static const _emitIntervalMs = 500;
-  static const _speedWindowMs = 500;
+  static const _emitIntervalMs = 250;
+  static const _speedWindowMs = 400;
 
   Future<String?> runJob({
     required Video video,
@@ -31,7 +31,14 @@ class DownloadService {
     final stamp = DateTime.now().millisecondsSinceEpoch;
     final safeTitle = _sanitize(video.title);
     final outputPath = p.join(tempDir.path, '${safeTitle}_$stamp.mp4');
-    final totalBytes = option.totalBytes <= 0 ? 1 : option.totalBytes;
+
+    // Manifest fresh saat download — URL lama dari layar player sering hang.
+    final fresh = await _youtube.resolveDownloadOption(
+      video.id.value,
+      option.height,
+    );
+    final job = fresh ?? option;
+    final totalBytes = job.totalBytes <= 0 ? 1 : job.totalBytes;
 
     var lastSpeedTick = DateTime.now();
     var lastSpeedBytes = 0;
@@ -76,52 +83,63 @@ class DownloadService {
     }
 
     try {
-      if (option.isMuxed && option.muxed != null) {
+      if (job.isMuxed && job.muxed != null) {
         emit('Mengunduh video', 0, force: true);
-        await _downloadStream(
-          option.muxed!,
+        await StreamDownloader.download(
+          job.muxed!,
           outputPath,
-          onBytes: (received) => emit('Mengunduh video', received),
+          yt: _youtube.client,
+          onBytes: (received, _) => emit('Mengunduh video', received),
         );
         emit('Mengunduh video', totalBytes, force: true);
       } else {
-        if (option.videoOnly == null || option.audioOnly == null) {
+        if (job.videoOnly == null || job.audioOnly == null) {
           throw Exception('Stream video/audio tidak tersedia');
         }
 
         final videoPath = p.join(
           tempDir.path,
-          'v_$stamp.${option.videoOnly!.container.name}',
+          'v_$stamp.${job.videoOnly!.container.name}',
         );
         final audioPath = p.join(
           tempDir.path,
-          'a_$stamp.${option.audioOnly!.container.name}',
+          'a_$stamp.${job.audioOnly!.container.name}',
         );
 
         var videoReceived = 0;
         var audioReceived = 0;
 
-        emit('Mengunduh video + audio', 0, force: true);
+        // Sequential — parallel video+audio sering hang di Android (~3%).
+        emit('Mengunduh video', 0, force: true);
+        await StreamDownloader.download(
+          job.videoOnly!,
+          videoPath,
+          yt: _youtube.client,
+          onBytes: (received, _) {
+            videoReceived = received;
+            emit(
+              'Mengunduh video',
+              videoReceived,
+              progressOverride: (videoReceived / (totalBytes * 0.75)).clamp(0, 0.70),
+            );
+          },
+        );
 
-        // Parallel download: hampir 2x lebih cepat daripada sekuensial.
-        await Future.wait([
-          _downloadStream(
-            option.videoOnly!,
-            videoPath,
-            onBytes: (received) {
-              videoReceived = received;
-              emit('Mengunduh video + audio', videoReceived + audioReceived);
-            },
-          ),
-          _downloadStream(
-            option.audioOnly!,
-            audioPath,
-            onBytes: (received) {
-              audioReceived = received;
-              emit('Mengunduh video + audio', videoReceived + audioReceived);
-            },
-          ),
-        ]);
+        emit('Mengunduh audio', videoReceived, force: true);
+        await StreamDownloader.download(
+          job.audioOnly!,
+          audioPath,
+          yt: _youtube.client,
+          onBytes: (received, _) {
+            audioReceived = received;
+            emit(
+              'Mengunduh audio',
+              videoReceived + audioReceived,
+              progressOverride:
+                  (0.70 + 0.25 * (audioReceived / (job.audioOnly!.size.totalBytes.clamp(1, 1 << 30)))).clamp(0.70, 0.95),
+            );
+          },
+        );
 
         emit(
           'Menggabungkan',
@@ -149,7 +167,6 @@ class DownloadService {
       );
       await Gal.putVideo(outputPath, album: 'YT Downloader');
 
-      // Salinan untuk "Buka di Klippod" (download stream tetap sama).
       final docs = await getApplicationDocumentsDirectory();
       final exportDir = Directory(p.join(docs.path, 'exports'));
       if (!await exportDir.exists()) {
@@ -171,35 +188,6 @@ class DownloadService {
       return exportPath;
     } finally {
       await _safeDelete(outputPath);
-    }
-  }
-
-  Future<void> _downloadStream(
-    StreamInfo info,
-    String path, {
-    required void Function(int received) onBytes,
-  }) async {
-    final file = File(path);
-    final sink = file.openWrite(mode: FileMode.writeOnly);
-    final total = info.size.totalBytes;
-    var received = 0;
-    var pendingEmit = 0;
-
-    try {
-      await for (final chunk in _youtube.openStream(info)) {
-        sink.add(chunk);
-        received += chunk.length;
-        pendingEmit += chunk.length;
-
-        if (pendingEmit >= 1024 * 1024 || (total > 0 && received >= total)) {
-          pendingEmit = 0;
-          onBytes(received);
-        }
-      }
-      await sink.flush();
-      onBytes(received);
-    } finally {
-      await sink.close();
     }
   }
 
