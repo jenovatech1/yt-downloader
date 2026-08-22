@@ -209,7 +209,7 @@ class YoutubeService {
 
   YoutubeExplode get client => _yt;
 
-  /// Manifest: default library (androidSdkless) dulu — androidVr/tv sering unplayable.
+  /// Manifest: default = androidSdkless (paling kompatibel per docs library).
   Future<StreamManifest> getManifest(String videoId) async {
     Object? lastError;
 
@@ -224,24 +224,21 @@ class YoutubeService {
       lastError = e;
     }
 
+    // Fallback berurutan — library skip client yang gagal lalu merge.
     try {
       return await _yt.videos.streamsClient.getManifest(
         videoId,
         ytClients: [
           YoutubeApiClient.androidSdkless,
-          YoutubeApiClient.android,
           YoutubeApiClient.ios,
-          YoutubeApiClient.androidVr,
-          YoutubeApiClient.tv,
-          YoutubeApiClient.mediaConnect,
+          YoutubeApiClient.android,
         ],
       );
     } catch (e) {
       lastError = e;
     }
 
-    throw lastError ??
-        Exception('Stream tidak tersedia untuk video ini.');
+    throw lastError ?? Exception('Stream tidak tersedia untuk video ini.');
   }
 
   /// Ambil ulang opsi download dengan URL fresh untuk [height].
@@ -392,16 +389,16 @@ class YoutubeService {
   MuxedStreamInfo? muxedAt(StreamManifest manifest, int height) =>
       _bestMuxedAt(manifest, height);
 
-  /// Dipakai Get Clip. Download biasa pakai [StreamDownloader] langsung.
+  /// Dipakai Get Clip — hanya via library get() (bukan HTTP plain).
   Future<void> downloadToFile(
     StreamInfo info,
     String path, {
     required void Function(int received, int total) onBytes,
   }) {
     return StreamDownloader.download(
+      _yt,
       info,
       path,
-      yt: _yt,
       onBytes: onBytes,
     );
   }

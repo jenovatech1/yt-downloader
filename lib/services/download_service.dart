@@ -19,7 +19,7 @@ class DownloadService {
 
   final YoutubeService _youtube;
 
-  static const _emitIntervalMs = 250;
+  static const _emitIntervalMs = 200;
   static const _speedWindowMs = 400;
 
   Future<String?> runJob({
@@ -31,14 +31,14 @@ class DownloadService {
     final stamp = DateTime.now().millisecondsSinceEpoch;
     final safeTitle = _sanitize(video.title);
     final outputPath = p.join(tempDir.path, '${safeTitle}_$stamp.mp4');
+    final videoId = video.id.value;
 
-    // Manifest fresh saat download — URL lama dari layar player sering hang.
-    final fresh = await _youtube.resolveDownloadOption(
-      video.id.value,
-      option.height,
-    );
-    final job = fresh ?? option;
+    // Manifest fresh. Docs library: android client sering tolak unduh
+    // >1 stream dari manifest yang sama → video & audio pakai manifest terpisah.
+    final job = await _youtube.resolveDownloadOption(videoId, option.height) ??
+        option;
     final totalBytes = job.totalBytes <= 0 ? 1 : job.totalBytes;
+    final yt = _youtube.client;
 
     var lastSpeedTick = DateTime.now();
     var lastSpeedBytes = 0;
@@ -68,13 +68,11 @@ class DownloadService {
       }
       lastEmitAt = now;
 
-      final progress =
-          progressOverride ?? (downloaded / totalBytes).clamp(0.0, 0.95);
-
       onProgress(
         DownloadProgress(
           phase: phase,
-          progress: progress,
+          progress: (progressOverride ?? (downloaded / totalBytes))
+              .clamp(0.0, 0.95),
           downloadedBytes: downloaded.clamp(0, totalBytes),
           totalBytes: totalBytes,
           speedBytesPerSecond: speed,
@@ -86,85 +84,81 @@ class DownloadService {
       if (job.isMuxed && job.muxed != null) {
         emit('Mengunduh video', 0, force: true);
         await StreamDownloader.download(
+          yt,
           job.muxed!,
           outputPath,
-          yt: _youtube.client,
           onBytes: (received, _) => emit('Mengunduh video', received),
         );
         emit('Mengunduh video', totalBytes, force: true);
       } else {
-        if (job.videoOnly == null || job.audioOnly == null) {
-          throw Exception('Stream video/audio tidak tersedia');
+        // Ambil video dari manifest #1
+        final manifestVideo = await _youtube.getManifest(videoId);
+        final videoOnly = _youtube.videoOnlyAt(manifestVideo, job.height) ??
+            job.videoOnly;
+        if (videoOnly == null) {
+          throw Exception('Stream video ${job.height}p tidak tersedia');
         }
 
         final videoPath = p.join(
           tempDir.path,
-          'v_$stamp.${job.videoOnly!.container.name}',
-        );
-        final audioPath = p.join(
-          tempDir.path,
-          'a_$stamp.${job.audioOnly!.container.name}',
+          'v_$stamp.${videoOnly.container.name}',
         );
 
-        var videoReceived = 0;
-        var audioReceived = 0;
-
-        // Sequential — parallel video+audio sering hang di Android (~3%).
         emit('Mengunduh video', 0, force: true);
+        var videoReceived = 0;
         await StreamDownloader.download(
-          job.videoOnly!,
+          yt,
+          videoOnly,
           videoPath,
-          yt: _youtube.client,
-          onBytes: (received, _) {
+          onBytes: (received, total) {
             videoReceived = received;
+            final t = total <= 0 ? 1 : total;
             emit(
               'Mengunduh video',
-              videoReceived,
-              progressOverride: (videoReceived / (totalBytes * 0.75)).clamp(0, 0.70),
+              received,
+              progressOverride: (0.72 * (received / t)).clamp(0, 0.72),
             );
           },
+        );
+
+        // Manifest #2 khusus audio (workaround restriksi YouTube).
+        await Future<void>.delayed(const Duration(milliseconds: 400));
+        final manifestAudio = await _youtube.getManifest(videoId);
+        final audioOnly =
+            _youtube.bestAudio(manifestAudio) ?? job.audioOnly;
+        if (audioOnly == null) {
+          throw Exception('Stream audio tidak tersedia');
+        }
+
+        final audioPath = p.join(
+          tempDir.path,
+          'a_$stamp.${audioOnly.container.name}',
         );
 
         emit('Mengunduh audio', videoReceived, force: true);
         await StreamDownloader.download(
-          job.audioOnly!,
+          yt,
+          audioOnly,
           audioPath,
-          yt: _youtube.client,
-          onBytes: (received, _) {
-            audioReceived = received;
+          onBytes: (received, total) {
+            final t = total <= 0 ? 1 : total;
             emit(
               'Mengunduh audio',
-              videoReceived + audioReceived,
-              progressOverride:
-                  (0.70 + 0.25 * (audioReceived / (job.audioOnly!.size.totalBytes.clamp(1, 1 << 30)))).clamp(0.70, 0.95),
+              videoReceived + received,
+              progressOverride: (0.72 + 0.23 * (received / t)).clamp(0.72, 0.95),
             );
           },
         );
 
-        emit(
-          'Menggabungkan',
-          totalBytes,
-          progressOverride: 0.96,
-          force: true,
-        );
+        emit('Menggabungkan', totalBytes, progressOverride: 0.96, force: true);
         await _merge(videoPath, audioPath, outputPath);
-        emit(
-          'Menggabungkan',
-          totalBytes,
-          progressOverride: 0.98,
-          force: true,
-        );
+        emit('Menggabungkan', totalBytes, progressOverride: 0.98, force: true);
 
         await _safeDelete(videoPath);
         await _safeDelete(audioPath);
       }
 
-      emit(
-        'Menyimpan ke galeri',
-        totalBytes,
-        progressOverride: 0.99,
-        force: true,
-      );
+      emit('Menyimpan ke galeri', totalBytes, progressOverride: 0.99, force: true);
       await Gal.putVideo(outputPath, album: 'YT Downloader');
 
       final docs = await getApplicationDocumentsDirectory();
@@ -228,9 +222,7 @@ class DownloadService {
   Future<void> _safeDelete(String path) async {
     try {
       final file = File(path);
-      if (await file.exists()) {
-        await file.delete();
-      }
+      if (await file.exists()) await file.delete();
     } catch (_) {}
   }
 }
