@@ -209,16 +209,39 @@ class YoutubeService {
 
   YoutubeExplode get client => _yt;
 
-  /// Cara stabil: androidVr (bukan ANDROID biasa — sering butuh JS decipher / hang).
-  Future<StreamManifest> getManifest(String videoId) {
-    return _yt.videos.streamsClient.getManifest(
-      videoId,
-      ytClients: [
-        YoutubeApiClient.androidVr,
-        YoutubeApiClient.mediaConnect,
-        YoutubeApiClient.tv,
-      ],
-    );
+  /// Manifest: default library (androidSdkless) dulu — androidVr/tv sering unplayable.
+  Future<StreamManifest> getManifest(String videoId) async {
+    Object? lastError;
+
+    try {
+      final m = await _yt.videos.streamsClient.getManifest(videoId);
+      if (m.audioOnly.isNotEmpty ||
+          m.videoOnly.isNotEmpty ||
+          m.muxed.isNotEmpty) {
+        return m;
+      }
+    } catch (e) {
+      lastError = e;
+    }
+
+    try {
+      return await _yt.videos.streamsClient.getManifest(
+        videoId,
+        ytClients: [
+          YoutubeApiClient.androidSdkless,
+          YoutubeApiClient.android,
+          YoutubeApiClient.ios,
+          YoutubeApiClient.androidVr,
+          YoutubeApiClient.tv,
+          YoutubeApiClient.mediaConnect,
+        ],
+      );
+    } catch (e) {
+      lastError = e;
+    }
+
+    throw lastError ??
+        Exception('Stream tidak tersedia untuk video ini.');
   }
 
   /// Ambil ulang opsi download dengan URL fresh untuk [height].
