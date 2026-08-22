@@ -46,18 +46,38 @@ class DownloadService {
     try {
       emit('Menyiapkan...', 0.02);
 
-      // Manifest fresh. Utamakan muxed (tidak throttle) kalau ada di resolusi itu.
       final manifest = await _youtube.getManifest(videoId);
-      final muxed = _youtube.muxedAt(manifest, option.height);
+      final muxedExact = _youtube.muxedAt(manifest, option.height);
+      final muxedBest = manifest.muxed.isEmpty
+          ? null
+          : (manifest.muxed.toList()
+                ..sort(
+                  (a, b) => b.videoResolution.height
+                      .compareTo(a.videoResolution.height),
+                ))
+              .first;
       final videoOnly = _youtube.videoOnlyAt(manifest, option.height);
       final audioOnly = _youtube.bestAudio(manifest);
 
-      if (muxed != null &&
-          (option.isMuxed || videoOnly == null || option.height <= 360)) {
-        final total = muxed.size.totalBytes;
-        emit('Mengunduh ${muxed.qualityLabel} (muxed)...', 0.05, total: total);
+      // Muxed lebih stabil (sering tidak throttle). Pakai kalau cocok / aman.
+      final useMuxed = muxedExact ??
+          (option.height <= 720 ? muxedBest : null) ??
+          (videoOnly == null || audioOnly == null ? muxedBest : null);
+
+      if (useMuxed != null &&
+          (option.isMuxed ||
+              option.height <= 720 ||
+              videoOnly == null ||
+              audioOnly == null ||
+              useMuxed.videoResolution.height >= option.height - 200)) {
+        final total = useMuxed.size.totalBytes;
+        emit(
+          'Mengunduh ${useMuxed.qualityLabel}...',
+          0.05,
+          total: total,
+        );
         await ChunkedStreamDownloader.download(
-          muxed,
+          useMuxed,
           outputPath,
           ytForRefresh: yt,
           onBytes: (r, t) => emit(
@@ -67,77 +87,52 @@ class DownloadService {
             total: t,
           ),
         );
+      } else if (videoOnly != null && audioOnly != null) {
+        final videoPath = p.join(
+          tempDir.path,
+          'v_$stamp.${videoOnly.container.name}',
+        );
+        final audioPath = p.join(
+          tempDir.path,
+          'a_$stamp.${audioOnly.container.name}',
+        );
+
+        emit('Mengunduh video...', 0.05, total: videoOnly.size.totalBytes);
+        await ChunkedStreamDownloader.download(
+          videoOnly,
+          videoPath,
+          ytForRefresh: yt,
+          onBytes: (r, t) => emit(
+            'Mengunduh video...',
+            0.05 + 0.55 * (t <= 0 ? 0 : r / t),
+            downloaded: r,
+            total: t,
+          ),
+        );
+
+        await Future<void>.delayed(const Duration(milliseconds: 600));
+        final m2 = await _youtube.getManifest(videoId);
+        final audio = _youtube.bestAudio(m2) ?? audioOnly;
+
+        emit('Mengunduh audio...', 0.62, total: audio.size.totalBytes);
+        await ChunkedStreamDownloader.download(
+          audio,
+          audioPath,
+          ytForRefresh: yt,
+          onBytes: (r, t) => emit(
+            'Mengunduh audio...',
+            0.62 + 0.28 * (t <= 0 ? 0 : r / t),
+            downloaded: r,
+            total: t,
+          ),
+        );
+
+        emit('Menggabungkan...', 0.92);
+        await _merge(videoPath, audioPath, outputPath);
+        await _safeDelete(videoPath);
+        await _safeDelete(audioPath);
       } else {
-        if (videoOnly == null || audioOnly == null) {
-          // Fallback muxed apa pun yang ada.
-          final anyMux = manifest.muxed.isEmpty
-              ? null
-              : (manifest.muxed.toList()
-                    ..sort((a, b) => b.videoResolution.height
-                        .compareTo(a.videoResolution.height)))
-                  .first;
-          if (anyMux == null) {
-            throw Exception('Tidak ada stream yang bisa diunduh.');
-          }
-          final total = anyMux.size.totalBytes;
-          emit('Mengunduh ${anyMux.qualityLabel} (muxed)...', 0.05, total: total);
-          await ChunkedStreamDownloader.download(
-            anyMux,
-            outputPath,
-            ytForRefresh: yt,
-            onBytes: (r, t) => emit(
-              'Mengunduh video...',
-              0.05 + 0.90 * (t <= 0 ? 0 : r / t),
-              downloaded: r,
-              total: t,
-            ),
-          );
-        } else {
-          final videoPath = p.join(
-            tempDir.path,
-            'v_$stamp.${videoOnly.container.name}',
-          );
-          final audioPath = p.join(
-            tempDir.path,
-            'a_$stamp.${audioOnly.container.name}',
-          );
-
-          emit('Mengunduh video...', 0.05, total: videoOnly.size.totalBytes);
-          await ChunkedStreamDownloader.download(
-            videoOnly,
-            videoPath,
-            ytForRefresh: yt,
-            onBytes: (r, t) => emit(
-              'Mengunduh video...',
-              0.05 + 0.55 * (t <= 0 ? 0 : r / t),
-              downloaded: r,
-              total: t,
-            ),
-          );
-
-          // Manifest baru untuk audio (restriksi android client).
-          await Future<void>.delayed(const Duration(milliseconds: 500));
-          final m2 = await _youtube.getManifest(videoId);
-          final audio = _youtube.bestAudio(m2) ?? audioOnly;
-
-          emit('Mengunduh audio...', 0.62, total: audio.size.totalBytes);
-          await ChunkedStreamDownloader.download(
-            audio,
-            audioPath,
-            ytForRefresh: yt,
-            onBytes: (r, t) => emit(
-              'Mengunduh audio...',
-              0.62 + 0.28 * (t <= 0 ? 0 : r / t),
-              downloaded: r,
-              total: t,
-            ),
-          );
-
-          emit('Menggabungkan...', 0.92);
-          await _merge(videoPath, audioPath, outputPath);
-          await _safeDelete(videoPath);
-          await _safeDelete(audioPath);
-        }
+        throw Exception('Tidak ada stream yang bisa diunduh.');
       }
 
       emit('Menyimpan ke galeri...', 0.96);
@@ -167,7 +162,11 @@ class DownloadService {
     }
   }
 
-  Future<void> _merge(String videoPath, String audioPath, String outputPath) async {
+  Future<void> _merge(
+    String videoPath,
+    String audioPath,
+    String outputPath,
+  ) async {
     var session = await FFmpegKit.execute(
       '-y -i "$videoPath" -i "$audioPath" -c:v copy -c:a copy -movflags +faststart "$outputPath"',
     );
