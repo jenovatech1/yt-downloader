@@ -297,23 +297,11 @@ class YoutubeService {
     for (final height in heights) {
       if (usedHeights.contains(height)) continue;
 
-      final muxed = _bestMuxedAt(manifest, height);
-      if (muxed != null) {
-        usedHeights.add(height);
-        options.add(
-          DownloadOption(
-            label: _qualityLabel(muxed.qualityLabel, height),
-            height: height,
-            totalBytes: muxed.size.totalBytes,
-            isMuxed: true,
-            muxed: muxed,
-          ),
-        );
-        continue;
-      }
-
       final videoOnly = _bestVideoOnlyAt(manifest, height);
-      if (videoOnly != null && audio != null) {
+      final muxed = _bestMuxedAt(manifest, height);
+
+      // Prefer adaptive (video+audio) untuk kualitas akurat; muxed max ~360p.
+      if (videoOnly != null && audio != null && height >= 480) {
         usedHeights.add(height);
         options.add(
           DownloadOption(
@@ -323,6 +311,20 @@ class YoutubeService {
             isMuxed: false,
             videoOnly: videoOnly,
             audioOnly: audio,
+          ),
+        );
+        continue;
+      }
+
+      if (muxed != null) {
+        usedHeights.add(height);
+        options.add(
+          DownloadOption(
+            label: _qualityLabel(muxed.qualityLabel, height),
+            height: height,
+            totalBytes: muxed.size.totalBytes,
+            isMuxed: true,
+            muxed: muxed,
           ),
         );
       }
@@ -360,6 +362,9 @@ class YoutubeService {
         .where((s) => s.videoResolution.height == height)
         .toList()
       ..sort((a, b) {
+        final codecScore = _videoCodecScore(b.videoCodec) -
+            _videoCodecScore(a.videoCodec);
+        if (codecScore != 0) return codecScore;
         final containerScore =
             _containerScore(b.container.name) - _containerScore(a.container.name);
         if (containerScore != 0) return containerScore;
@@ -419,6 +424,14 @@ class YoutubeService {
     if (lower.contains('mp4') || lower.contains('m4a')) return 2;
     if (lower.contains('webm')) return 1;
     return 0;
+  }
+
+  int _videoCodecScore(String codec) {
+    final lower = codec.toLowerCase();
+    if (lower.contains('avc') || lower.contains('h264')) return 3;
+    if (lower.contains('av01') || lower.contains('av1')) return 1;
+    if (lower.contains('vp9') || lower.contains('vp09')) return 0;
+    return 2;
   }
 
   void dispose() {

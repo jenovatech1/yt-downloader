@@ -15,7 +15,8 @@ import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 class YtStreamDownloader {
   /// YouTube app memakai ~2MB; >10MB sering di-throttle keras.
   static const chunkSize = 2 * 1024 * 1024;
-  static const concurrency = 6;
+  /// 3 lebih stabil di HP Android daripada 6 (lebih jarang 403).
+  static const concurrency = 3;
   static const _ua =
       'com.google.android.youtube/19.29.1 (Linux; U; Android 14) gzip';
   static const _timeout = Duration(seconds: 60);
@@ -97,7 +98,6 @@ class YtStreamDownloader {
     }
 
     var url = info.url;
-    var received = 0;
     // Progress counter aman untuk parallel di isolate yang sama.
     final progress = <int>[0];
 
@@ -260,6 +260,10 @@ class YtStreamDownloader {
         await sink.close();
       }
       if (received < 2048) throw Exception('File terlalu kecil');
+      if (total > 0 && received < (total * 0.95).round()) {
+        throw Exception('File terpotong ($received / $total)');
+      }
+      onBytes(total > 0 ? total : received, total > 0 ? total : received);
     } finally {
       client.close();
     }
