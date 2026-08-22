@@ -9,8 +9,8 @@ import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
 import '../models/download_option.dart';
 import '../models/download_progress.dart';
-import 'chunked_stream_downloader.dart';
 import 'youtube_service.dart';
+import 'yt_stream_downloader.dart';
 
 typedef DetailedProgressCallback = void Function(DownloadProgress progress);
 
@@ -44,122 +44,135 @@ class DownloadService {
     }
 
     try {
-      emit('Menyiapkan...', 0.02);
-
+      emit('Menyiapkan ${option.label}...', 0.02);
       final manifest = await _youtube.getManifest(videoId);
-      final muxedExact = _youtube.muxedAt(manifest, option.height);
-      final muxedBest = manifest.muxed.isEmpty
-          ? null
-          : (manifest.muxed.toList()
-                ..sort(
-                  (a, b) => b.videoResolution.height
-                      .compareTo(a.videoResolution.height),
-                ))
-              .first;
-      final videoOnly = _youtube.videoOnlyAt(manifest, option.height);
-      final audioOnly = _youtube.bestAudio(manifest);
 
-      // Muxed lebih stabil (sering tidak throttle). Pakai kalau cocok / aman.
-      final useMuxed = muxedExact ??
-          (option.height <= 720 ? muxedBest : null) ??
-          (videoOnly == null || audioOnly == null ? muxedBest : null);
+      // PENTING: jangan ganti 720/1080 ke muxed 360p.
+      // Muxed HANYA kalau user pilih opsi muxed, atau adaptive tidak ada.
+      final muxed = _youtube.muxedAt(manifest, option.height) ?? option.muxed;
+      final videoOnly =
+          _youtube.videoOnlyAt(manifest, option.height) ?? option.videoOnly;
+      final audioOnly = _youtube.bestAudio(manifest) ?? option.audioOnly;
 
-      if (useMuxed != null &&
-          (option.isMuxed ||
-              option.height <= 720 ||
-              videoOnly == null ||
-              audioOnly == null ||
-              useMuxed.videoResolution.height >= option.height - 200)) {
-        final total = useMuxed.size.totalBytes;
-        emit(
-          'Mengunduh ${useMuxed.qualityLabel}...',
-          0.05,
-          total: total,
-        );
-        await ChunkedStreamDownloader.download(
-          useMuxed,
-          outputPath,
-          ytForRefresh: yt,
-          onBytes: (r, t) => emit(
-            'Mengunduh video...',
-            0.05 + 0.90 * (t <= 0 ? 0 : r / t),
-            downloaded: r,
-            total: t,
-          ),
-        );
-      } else if (videoOnly != null && audioOnly != null) {
-        final videoPath = p.join(
-          tempDir.path,
-          'v_$stamp.${videoOnly.container.name}',
-        );
-        final audioPath = p.join(
-          tempDir.path,
-          'a_$stamp.${audioOnly.container.name}',
-        );
+      final wantMuxed = option.isMuxed && muxed != null;
+      final canAdaptive = videoOnly != null && audioOnly != null;
+      final useMuxed = wantMuxed || (!canAdaptive && muxed != null);
 
-        emit('Mengunduh video...', 0.05, total: videoOnly.size.totalBytes);
-        await ChunkedStreamDownloader.download(
-          videoOnly,
-          videoPath,
-          ytForRefresh: yt,
-          onBytes: (r, t) => emit(
-            'Mengunduh video...',
-            0.05 + 0.55 * (t <= 0 ? 0 : r / t),
-            downloaded: r,
-            total: t,
-          ),
-        );
-
-        await Future<void>.delayed(const Duration(milliseconds: 600));
-        final m2 = await _youtube.getManifest(videoId);
-        final audio = _youtube.bestAudio(m2) ?? audioOnly;
-
-        emit('Mengunduh audio...', 0.62, total: audio.size.totalBytes);
-        await ChunkedStreamDownloader.download(
-          audio,
-          audioPath,
-          ytForRefresh: yt,
-          onBytes: (r, t) => emit(
-            'Mengunduh audio...',
-            0.62 + 0.28 * (t <= 0 ? 0 : r / t),
-            downloaded: r,
-            total: t,
-          ),
-        );
-
-        emit('Menggabungkan...', 0.92);
-        await _merge(videoPath, audioPath, outputPath);
-        await _safeDelete(videoPath);
-        await _safeDelete(audioPath);
-      } else {
-        throw Exception('Tidak ada stream yang bisa diunduh.');
+      if (useMuxed && muxed != null) {
+        // Pastikan resolusi muxed tidak jauh di bawah pilihan user.
+        if (option.height >= 720 &&
+            muxed.videoResolution.height < option.height - 80 &&
+            canAdaptive) {
+          // Abaikan muxed rendah — pakai adaptive.
+        } else {
+          final total = muxed.size.totalBytes;
+          emit('Mengunduh ${muxed.qualityLabel}...', 0.05, total: total);
+          await YtStreamDownloader.download(
+            muxed,
+            outputPath,
+            yt: yt,
+            onBytes: (r, t) => emit(
+              'Mengunduh ${muxed.qualityLabel}...',
+              0.05 + 0.90 * (t <= 0 ? 0 : r / t),
+              downloaded: r,
+              total: t,
+            ),
+          );
+          return _finish(outputPath, safeTitle, stamp, total, onProgress, emit);
+        }
       }
 
-      emit('Menyimpan ke galeri...', 0.96);
-      await Gal.putVideo(outputPath, album: 'YT Downloader');
-
-      final docs = await getApplicationDocumentsDirectory();
-      final exportDir = Directory(p.join(docs.path, 'exports'));
-      if (!await exportDir.exists()) {
-        await exportDir.create(recursive: true);
+      if (videoOnly == null || audioOnly == null) {
+        throw Exception(
+          'Stream ${option.label} tidak tersedia. Coba resolusi lain.',
+        );
       }
-      final exportPath = p.join(exportDir.path, '${safeTitle}_$stamp.mp4');
-      await File(outputPath).copy(exportPath);
 
-      onProgress(
-        DownloadProgress(
-          phase: 'Selesai',
-          progress: 1,
-          downloadedBytes: 1,
-          totalBytes: 1,
-          speedBytesPerSecond: 0,
-          isDone: true,
+      final videoPath = p.join(
+        tempDir.path,
+        'v_$stamp.${videoOnly.container.name}',
+      );
+      final audioPath = p.join(
+        tempDir.path,
+        'a_$stamp.${audioOnly.container.name}',
+      );
+
+      emit(
+        'Mengunduh video ${option.label}...',
+        0.05,
+        total: videoOnly.size.totalBytes,
+      );
+      await YtStreamDownloader.download(
+        videoOnly,
+        videoPath,
+        yt: yt,
+        onBytes: (r, t) => emit(
+          'Mengunduh video ${option.label}...',
+          0.05 + 0.55 * (t <= 0 ? 0 : r / t),
+          downloaded: r,
+          total: t,
         ),
       );
-      return exportPath;
+
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      final m2 = await _youtube.getManifest(videoId);
+      final audio = _youtube.bestAudio(m2) ?? audioOnly;
+
+      emit('Mengunduh audio...', 0.62, total: audio.size.totalBytes);
+      await YtStreamDownloader.download(
+        audio,
+        audioPath,
+        yt: yt,
+        onBytes: (r, t) => emit(
+          'Mengunduh audio...',
+          0.62 + 0.28 * (t <= 0 ? 0 : r / t),
+          downloaded: r,
+          total: t,
+        ),
+      );
+
+      emit('Menggabungkan...', 0.92);
+      await _merge(videoPath, audioPath, outputPath);
+      await _safeDelete(videoPath);
+      await _safeDelete(audioPath);
+
+      final total = videoOnly.size.totalBytes + audio.size.totalBytes;
+      return _finish(outputPath, safeTitle, stamp, total, onProgress, emit);
     } finally {
       await _safeDelete(outputPath);
     }
+  }
+
+  Future<String> _finish(
+    String outputPath,
+    String safeTitle,
+    int stamp,
+    int total,
+    DetailedProgressCallback onProgress,
+    void Function(String, double, {int downloaded, int total}) emit,
+  ) async {
+    emit('Menyimpan ke galeri...', 0.96);
+    await Gal.putVideo(outputPath, album: 'YT Downloader');
+
+    final docs = await getApplicationDocumentsDirectory();
+    final exportDir = Directory(p.join(docs.path, 'exports'));
+    if (!await exportDir.exists()) {
+      await exportDir.create(recursive: true);
+    }
+    final exportPath = p.join(exportDir.path, '${safeTitle}_$stamp.mp4');
+    await File(outputPath).copy(exportPath);
+
+    onProgress(
+      DownloadProgress(
+        phase: 'Selesai',
+        progress: 1,
+        downloadedBytes: total,
+        totalBytes: total <= 0 ? 1 : total,
+        speedBytesPerSecond: 0,
+        isDone: true,
+      ),
+    );
+    return exportPath;
   }
 
   Future<void> _merge(

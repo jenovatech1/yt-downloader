@@ -10,9 +10,9 @@ import '../models/download_option.dart';
 import '../models/download_progress.dart';
 import '../models/hook_clip.dart';
 import 'api_keys_service.dart';
-import 'chunked_stream_downloader.dart';
 import 'clip_ai_service.dart';
 import 'youtube_service.dart';
+import 'yt_stream_downloader.dart';
 
 class ClipPipelineResult {
   const ClipPipelineResult({
@@ -62,50 +62,65 @@ class ClipPipeline {
       if (await workDir.exists()) await workDir.delete(recursive: true);
       await workDir.create(recursive: true);
 
-      emit('Mengunduh audio...', 0.08);
-      String? rawAudio;
-      Object? lastErr;
-      for (var attempt = 1; attempt <= 3; attempt++) {
-        try {
-          final manifest = await yt.getManifest(video.id.value);
-          final audio = yt.compactAudio(manifest) ?? yt.bestAudio(manifest);
-          if (audio == null) throw Exception('Audio tidak tersedia');
-          final path = p.join(
-            workDir.path,
-            'audio_${attempt}.${audio.container.name}',
-          );
-          await ChunkedStreamDownloader.download(
-            audio,
-            path,
-            ytForRefresh: yt.client,
-            onBytes: (r, t) {
-              final f = t <= 0 ? 0.0 : r / t;
-              emit('Mengunduh audio...', 0.08 + 0.22 * f);
-            },
-          );
-          rawAudio = path;
-          break;
-        } catch (e) {
-          lastErr = e;
-          await Future<void>.delayed(Duration(milliseconds: 400 * attempt));
-        }
-      }
-      if (rawAudio == null) {
-        throw Exception('Gagal unduh audio.\n$lastErr');
+      // Audio untuk transkrip: ambil dari MUXED (tidak throttle) lalu ekstrak.
+      // Adaptive audio-only sering hang di Android.
+      emit('Mengunduh audio (muxed)...', 0.08);
+      final m0 = await yt.getManifest(video.id.value);
+      final muxForAudio = m0.muxed.isEmpty
+          ? null
+          : (m0.muxed.toList()
+                ..sort((a, b) => a.size.totalBytes.compareTo(b.size.totalBytes)))
+              .first;
+      if (muxForAudio == null) {
+        throw Exception('Tidak ada stream muxed untuk audio. Coba video lain.');
       }
 
-      emit('Kompres audio...', 0.32);
+      final muxPath = p.join(workDir.path, 'mux_audio_src.mp4');
+      await YtStreamDownloader.download(
+        muxForAudio,
+        muxPath,
+        yt: yt.client,
+        onBytes: (r, t) {
+          final f = t <= 0 ? 0.0 : r / t;
+          emit('Mengunduh audio...', 0.08 + 0.20 * f);
+        },
+      );
+
+      emit('Ekstrak audio...', 0.30);
       final smallAudio = p.join(workDir.path, 'audio_small.m4a');
       await _ffmpeg(
-        ['-y', '-i', rawAudio, '-c:a', 'aac', '-b:a', '64k', '-ac', '1', smallAudio],
-        fallback: ['-y', '-i', rawAudio, '-c:a', 'aac', '-b:a', '64k', smallAudio],
+        [
+          '-y',
+          '-i',
+          muxPath,
+          '-vn',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '64k',
+          '-ac',
+          '1',
+          smallAudio,
+        ],
+        fallback: [
+          '-y',
+          '-i',
+          muxPath,
+          '-vn',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '64k',
+          smallAudio,
+        ],
       );
-      final transcribeFile =
-          await File(smallAudio).exists() ? File(smallAudio) : File(rawAudio);
+      try {
+        await File(muxPath).delete();
+      } catch (_) {}
 
       emit('Transkrip audio (AI)...', 0.40);
       final transcript = await _ai.transcribe(
-        audioFile: transcribeFile,
+        audioFile: File(smallAudio),
         groqKey: groq,
         geminiKey: gemini,
       );
@@ -124,48 +139,41 @@ class ClipPipeline {
         throw Exception('AI tidak menemukan hook di video ini.');
       }
 
-      emit('Mengunduh sumber video...', 0.60);
-      final mSrc = await yt.getManifest(video.id.value);
-      final muxed = yt.muxedAt(mSrc, option.height) ??
-          (mSrc.muxed.isEmpty
+      // Sumber potong: adaptive sesuai pilihan, fallback muxed.
+      emit('Mengunduh sumber klip (${option.label})...', 0.60);
+      final sourcePath = p.join(workDir.path, 'source.mp4');
+      final m1 = await yt.getManifest(video.id.value);
+      final videoOnly = yt.videoOnlyAt(m1, option.height);
+      final audioOnly = yt.bestAudio(m1);
+      final muxed = yt.muxedAt(m1, option.height) ??
+          (m1.muxed.isEmpty
               ? null
-              : (mSrc.muxed.toList()
+              : (m1.muxed.toList()
                     ..sort((a, b) => b.videoResolution.height
                         .compareTo(a.videoResolution.height)))
                   .first);
-      final videoOnly = yt.videoOnlyAt(mSrc, option.height);
-      final sourcePath = p.join(workDir.path, 'source.mp4');
 
-      if (muxed != null && (videoOnly == null || option.height <= 480)) {
-        await ChunkedStreamDownloader.download(
-          muxed,
-          sourcePath,
-          ytForRefresh: yt.client,
-          onBytes: (r, t) {
-            final f = t <= 0 ? 0.0 : r / t;
-            emit('Mengunduh sumber...', 0.60 + 0.18 * f);
-          },
-        );
-      } else if (videoOnly != null) {
-        final vPath = p.join(workDir.path, 'source_v.${videoOnly.container.name}');
-        await ChunkedStreamDownloader.download(
+      if (videoOnly != null && audioOnly != null && option.height >= 480) {
+        final vPath =
+            p.join(workDir.path, 'src_v.${videoOnly.container.name}');
+        final aPath =
+            p.join(workDir.path, 'src_a.${audioOnly.container.name}');
+        await YtStreamDownloader.download(
           videoOnly,
           vPath,
-          ytForRefresh: yt.client,
+          yt: yt.client,
           onBytes: (r, t) {
             final f = t <= 0 ? 0.0 : r / t;
-            emit('Mengunduh video...', 0.60 + 0.10 * f);
+            emit('Mengunduh video sumber...', 0.60 + 0.10 * f);
           },
         );
         await Future<void>.delayed(const Duration(milliseconds: 500));
-        final mA = await yt.getManifest(video.id.value);
-        final audio = yt.bestAudio(mA);
-        if (audio == null) throw Exception('Audio sumber hilang');
-        final aPath = p.join(workDir.path, 'source_a.${audio.container.name}');
-        await ChunkedStreamDownloader.download(
+        final m2 = await yt.getManifest(video.id.value);
+        final audio = yt.bestAudio(m2) ?? audioOnly;
+        await YtStreamDownloader.download(
           audio,
           aPath,
-          ytForRefresh: yt.client,
+          yt: yt.client,
           onBytes: (r, t) {
             final f = t <= 0 ? 0.0 : r / t;
             emit('Mengunduh audio sumber...', 0.70 + 0.08 * f);
@@ -204,8 +212,18 @@ class ClipPipeline {
             sourcePath,
           ],
         );
+      } else if (muxed != null) {
+        await YtStreamDownloader.download(
+          muxed,
+          sourcePath,
+          yt: yt.client,
+          onBytes: (r, t) {
+            final f = t <= 0 ? 0.0 : r / t;
+            emit('Mengunduh sumber...', 0.60 + 0.18 * f);
+          },
+        );
       } else {
-        throw Exception('Tidak ada stream video untuk klip.');
+        throw Exception('Tidak ada stream untuk potong klip.');
       }
 
       final clips = <HookClip>[];
@@ -259,8 +277,9 @@ class ClipPipeline {
             outPath,
           ],
         );
-        if (!await File(outPath).exists() || await File(outPath).length() < 1024) {
-          throw Exception('Gagal potong klip di $ss');
+        if (!await File(outPath).exists() ||
+            await File(outPath).length() < 1024) {
+          throw Exception('Gagal potong klip @ $ss');
         }
         clips.add(
           HookClip(
