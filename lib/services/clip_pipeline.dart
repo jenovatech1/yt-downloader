@@ -11,8 +11,7 @@ import '../models/download_progress.dart';
 import '../models/hook_clip.dart';
 import 'api_keys_service.dart';
 import 'clip_ai_service.dart';
-import 'youtube_service.dart';
-import 'yt_stream_downloader.dart';
+import 'yt_dlp_service.dart';
 
 class ClipPipelineResult {
   const ClipPipelineResult({
@@ -54,45 +53,28 @@ class ClipPipeline {
       );
     }
 
-    final yt = YoutubeService();
     final youtubeUrl = 'https://www.youtube.com/watch?v=${video.id.value}';
+    final docs = await getApplicationDocumentsDirectory();
+    final workDir = Directory(p.join(docs.path, 'clips', video.id.value));
+    if (await workDir.exists()) await workDir.delete(recursive: true);
+    await workDir.create(recursive: true);
+
     try {
-      final docs = await getApplicationDocumentsDirectory();
-      final workDir = Directory(p.join(docs.path, 'clips', video.id.value));
-      if (await workDir.exists()) await workDir.delete(recursive: true);
-      await workDir.create(recursive: true);
-
-      // Audio untuk transkrip: ambil dari MUXED (tidak throttle) lalu ekstrak.
-      // Adaptive audio-only sering hang di Android.
-      emit('Mengunduh audio (muxed)...', 0.08);
-      final m0 = await yt.getManifest(video.id.value);
-      final muxForAudio = m0.muxed.isEmpty
-          ? null
-          : (m0.muxed.toList()
-                ..sort((a, b) => a.size.totalBytes.compareTo(b.size.totalBytes)))
-              .first;
-      if (muxForAudio == null) {
-        throw Exception('Tidak ada stream muxed untuk audio. Coba video lain.');
-      }
-
-      final muxPath = p.join(workDir.path, 'mux_audio_src.mp4');
-      await YtStreamDownloader.download(
-        muxForAudio,
-        muxPath,
-        yt: yt.client,
-        onBytes: (r, t) {
-          final f = t <= 0 ? 0.0 : r / t;
-          emit('Mengunduh audio...', 0.08 + 0.20 * f);
-        },
+      emit('Mengunduh audio (yt-dlp)...', 0.08);
+      final audioPath = await YtDlpService.instance.downloadAudio(
+        videoId: video.id.value,
+        outputDir: p.join(workDir.path, 'audio'),
+        onProgress: (pct, phase) => emit(phase, 0.08 + 0.22 * pct),
       );
 
-      emit('Ekstrak audio...', 0.30);
+      // Kompres bila perlu untuk upload AI.
+      emit('Siapkan audio...', 0.32);
       final smallAudio = p.join(workDir.path, 'audio_small.m4a');
       await _ffmpeg(
         [
           '-y',
           '-i',
-          muxPath,
+          audioPath,
           '-vn',
           '-c:a',
           'aac',
@@ -100,23 +82,20 @@ class ClipPipeline {
           '64k',
           '-ac',
           '1',
+          '-ar',
+          '16000',
           smallAudio,
         ],
         fallback: [
           '-y',
           '-i',
-          muxPath,
+          audioPath,
           '-vn',
           '-c:a',
-          'aac',
-          '-b:a',
-          '64k',
+          'copy',
           smallAudio,
         ],
       );
-      try {
-        await File(muxPath).delete();
-      } catch (_) {}
 
       emit('Transkrip audio (AI)...', 0.40);
       final transcript = await _ai.transcribe(
@@ -124,107 +103,25 @@ class ClipPipeline {
         groqKey: groq,
         geminiKey: gemini,
       );
-
-      final duration = video.duration ?? Duration.zero;
-      emit('Mencari hook (AI)...', 0.55);
+      emit('Cari hook (AI)...', 0.48);
       final hooks = await _ai.suggestHooks(
         transcript: transcript,
-        videoDuration:
-            duration.inSeconds > 0 ? duration : const Duration(minutes: 10),
+        videoDuration: video.duration ?? const Duration(minutes: 10),
         groqKey: groq,
         geminiKey: gemini,
         youtubeUrl: youtubeUrl,
       );
       if (hooks.isEmpty) {
-        throw Exception('AI tidak menemukan hook di video ini.');
+        throw Exception('AI tidak menemukan hook. Coba video lain.');
       }
 
-      // Sumber potong: adaptive sesuai pilihan, fallback muxed.
-      emit('Mengunduh sumber klip (${option.label})...', 0.60);
-      final sourcePath = p.join(workDir.path, 'source.mp4');
-      final m1 = await yt.getManifest(video.id.value);
-      final videoOnly = yt.videoOnlyAt(m1, option.height);
-      final audioOnly = yt.bestAudio(m1);
-      final muxed = yt.muxedAt(m1, option.height) ??
-          (m1.muxed.isEmpty
-              ? null
-              : (m1.muxed.toList()
-                    ..sort((a, b) => b.videoResolution.height
-                        .compareTo(a.videoResolution.height)))
-                  .first);
-
-      if (videoOnly != null && audioOnly != null && option.height >= 480) {
-        final vPath =
-            p.join(workDir.path, 'src_v.${videoOnly.container.name}');
-        final aPath =
-            p.join(workDir.path, 'src_a.${audioOnly.container.name}');
-        await YtStreamDownloader.download(
-          videoOnly,
-          vPath,
-          yt: yt.client,
-          onBytes: (r, t) {
-            final f = t <= 0 ? 0.0 : r / t;
-            emit('Mengunduh video sumber...', 0.60 + 0.10 * f);
-          },
-        );
-        await Future<void>.delayed(const Duration(milliseconds: 500));
-        final m2 = await yt.getManifest(video.id.value);
-        final audio = yt.bestAudio(m2) ?? audioOnly;
-        await YtStreamDownloader.download(
-          audio,
-          aPath,
-          yt: yt.client,
-          onBytes: (r, t) {
-            final f = t <= 0 ? 0.0 : r / t;
-            emit('Mengunduh audio sumber...', 0.70 + 0.08 * f);
-          },
-        );
-        emit('Menggabungkan sumber...', 0.78);
-        await _ffmpeg(
-          [
-            '-y',
-            '-i',
-            vPath,
-            '-i',
-            aPath,
-            '-c:v',
-            'copy',
-            '-c:a',
-            'copy',
-            '-movflags',
-            '+faststart',
-            sourcePath,
-          ],
-          fallback: [
-            '-y',
-            '-i',
-            vPath,
-            '-i',
-            aPath,
-            '-c:v',
-            'copy',
-            '-c:a',
-            'aac',
-            '-b:a',
-            '128k',
-            '-movflags',
-            '+faststart',
-            sourcePath,
-          ],
-        );
-      } else if (muxed != null) {
-        await YtStreamDownloader.download(
-          muxed,
-          sourcePath,
-          yt: yt.client,
-          onBytes: (r, t) {
-            final f = t <= 0 ? 0.0 : r / t;
-            emit('Mengunduh sumber...', 0.60 + 0.18 * f);
-          },
-        );
-      } else {
-        throw Exception('Tidak ada stream untuk potong klip.');
-      }
+      emit('Mengunduh sumber video (yt-dlp)...', 0.58);
+      final sourcePath = await YtDlpService.instance.downloadVideo(
+        videoId: video.id.value,
+        height: option.height.clamp(360, 1080),
+        outputDir: p.join(workDir.path, 'source'),
+        onProgress: (pct, phase) => emit(phase, 0.58 + 0.20 * pct),
+      );
 
       final clips = <HookClip>[];
       for (var i = 0; i < hooks.length; i++) {
@@ -248,12 +145,10 @@ class ClipPipeline {
             t,
             '-i',
             sourcePath,
-            '-c:v',
+            '-c',
             'copy',
-            '-c:a',
-            'copy',
-            '-movflags',
-            '+faststart',
+            '-avoid_negative_ts',
+            'make_zero',
             outPath,
           ],
           fallback: [
@@ -265,53 +160,35 @@ class ClipPipeline {
             '-i',
             sourcePath,
             '-c:v',
-            'mpeg4',
-            '-q:v',
-            '5',
+            'copy',
             '-c:a',
             'aac',
             '-b:a',
             '128k',
-            '-movflags',
-            '+faststart',
             outPath,
           ],
         );
-        if (!await File(outPath).exists() ||
-            await File(outPath).length() < 1024) {
-          throw Exception('Gagal potong klip @ $ss');
-        }
         clips.add(
           HookClip(
             index: i,
             startSec: hook.startSec,
             endSec: hook.endSec,
             filePath: outPath,
-            title: hook.reason ?? 'Klip ${i + 1}',
+            title: hook.reason,
             hookScore: hook.score,
           ),
         );
       }
 
-      emit('Klip siap', 1);
-      onProgress(
-        DownloadProgress(
-          phase: 'Klip siap',
-          progress: 1,
-          downloadedBytes: 0,
-          totalBytes: 0,
-          speedBytesPerSecond: 0,
-          isDone: true,
-        ),
-      );
-
+      emit('Selesai', 1);
       return ClipPipelineResult(
         clips: clips,
         youtubeUrl: youtubeUrl,
         sourceTitle: video.title,
       );
-    } finally {
-      yt.dispose();
+    } catch (e) {
+      emit('Gagal', 0);
+      rethrow;
     }
   }
 

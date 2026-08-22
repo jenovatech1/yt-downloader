@@ -43,10 +43,15 @@ android {
 
     packaging {
         jniLibs {
+            useLegacyPackaging = true
             excludes += setOf(
                 "**/armeabi-v7a/**",
                 "**/x86/**",
                 "**/x86_64/**",
+            )
+            pickFirsts += setOf(
+                "**/libc++_shared.so",
+                "**/libjsc.so",
             )
         }
     }
