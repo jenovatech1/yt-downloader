@@ -11,14 +11,12 @@ import '../models/download_progress.dart';
 import '../utils/format_utils.dart';
 import 'download_service.dart';
 import 'notification_service.dart';
-import 'youtube_service.dart';
 
 class DownloadManager with WidgetsBindingObserver {
   DownloadManager._();
   static final DownloadManager instance = DownloadManager._();
 
-  final _youtube = YoutubeService();
-  late final DownloadService _downloader = DownloadService(_youtube);
+  late final DownloadService _downloader = DownloadService();
   final _progressController = StreamController<DownloadProgress>.broadcast();
   Stream<DownloadProgress> get progressStream => _progressController.stream;
 
