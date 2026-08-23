@@ -1,17 +1,18 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'screens/home_screen.dart';
 import 'services/download_manager.dart';
-import 'services/yt_dlp_service.dart';
 import 'theme/app_theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await DownloadManager.instance.initialize();
-  unawaited(YtDlpService.instance.ensureReady());
+
+  // Jangan init yt-dlp di sini — native extract bisa crash proses.
+  // Init lazy saat user download.
+  try {
+    await DownloadManager.instance.initialize();
+  } catch (_) {}
 
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,

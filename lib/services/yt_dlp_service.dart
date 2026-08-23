@@ -17,15 +17,15 @@ class YtDlpService {
 
   Future<void> ensureReady() async {
     if (_ready) return;
+    // FFmpeg dari yt-dlp dimatikan — app sudah punya ffmpeg_kit (hindari konflik .so).
     final init = await _dl.initialize(
-      enableFFmpeg: true,
+      enableFFmpeg: false,
       enableAria2c: true,
     );
     if (!init.success) {
       throw Exception(init.errorMessage ?? 'Gagal init yt-dlp');
     }
     _ready = true;
-    // Update binary di background (yt-dlp 2026.x).
     unawaited(_tryUpdate());
   }
 

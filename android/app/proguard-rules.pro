@@ -10,3 +10,8 @@
 -keep class com.github.TeamNewPipe.** { *; }
 -keep class okhttp3.** { *; }
 -dontwarn org.mozilla.javascript.**
+
+# yt-dlp / youtubedl-android
+-keep class com.yausername.** { *; }
+-keep class com.ashishpipaliya.extractor.** { *; }
+-dontwarn com.yausername.**
