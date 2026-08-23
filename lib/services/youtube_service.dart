@@ -209,7 +209,7 @@ class YoutubeService {
 
   YoutubeExplode get client => _yt;
 
-  /// Manifest: iOS dulu (HLS), lalu ANDROID_VR / sdkless progressive.
+  /// Manifest: iOS wajib (HLS). Client lain hanya pelengkap muxed rendah.
   Future<StreamManifest> getManifest(String videoId) async {
     Object? lastError;
 
@@ -218,10 +218,19 @@ class YoutubeService {
         videoId,
         ytClients: [
           YoutubeApiClient.ios,
-          YoutubeApiClient.androidVr,
           YoutubeApiClient.androidSdkless,
         ],
       );
+    } catch (e) {
+      lastError = e;
+    }
+
+    try {
+      final m = await _yt.videos.streamsClient.getManifest(
+        videoId,
+        ytClients: [YoutubeApiClient.ios],
+      );
+      if (m.hls.isNotEmpty || m.muxed.isNotEmpty) return m;
     } catch (e) {
       lastError = e;
     }
@@ -284,7 +293,6 @@ class YoutubeService {
 
   Future<List<DownloadOption>> getDownloadOptions(String videoId) async {
     final manifest = await getManifest(videoId);
-    final audio = _bestAudio(manifest);
     final hlsAudio = _bestHlsAudio(manifest);
     final options = <DownloadOption>[];
     final usedHeights = <int>{};
@@ -301,7 +309,7 @@ class YoutubeService {
     for (final height in heights) {
       if (usedHeights.contains(height)) continue;
 
-      // 1) HLS (iOS) — segment download tahan 403 progressive di HP.
+      // 1) HLS only for HD — progressive adaptive 403 di banyak CDN HP (2026).
       final hlsV = _bestHlsVideoAt(manifest, height);
       if (hlsV != null && hlsAudio != null) {
         usedHeights.add(height);
@@ -313,31 +321,12 @@ class YoutubeService {
             isMuxed: false,
             hlsVideo: hlsV,
             hlsAudio: hlsAudio,
-            videoOnly: _bestVideoOnlyAt(manifest, height),
-            audioOnly: audio,
           ),
         );
         continue;
       }
 
-      // 2) Adaptive progressive.
-      final videoOnly = _bestVideoOnlyAt(manifest, height);
-      if (videoOnly != null && audio != null && height >= 480) {
-        usedHeights.add(height);
-        options.add(
-          DownloadOption(
-            label: _qualityLabel(videoOnly.qualityLabel, height),
-            height: height,
-            totalBytes: videoOnly.size.totalBytes + audio.size.totalBytes,
-            isMuxed: false,
-            videoOnly: videoOnly,
-            audioOnly: audio,
-          ),
-        );
-        continue;
-      }
-
-      // 3) Muxed (biasanya ≤360p).
+      // 2) Muxed (biasanya ≤360p).
       final muxed = _bestMuxedAt(manifest, height);
       if (muxed != null) {
         usedHeights.add(height);
@@ -419,6 +408,27 @@ class YoutubeService {
 
   HlsVideoStreamInfo? hlsVideoAt(StreamManifest manifest, int height) =>
       _bestHlsVideoAt(manifest, height);
+
+  /// Closest HLS height ≤ requested (fallback kalau exact height hilang).
+  HlsVideoStreamInfo? hlsVideoClosest(StreamManifest manifest, int height) {
+    final exact = _bestHlsVideoAt(manifest, height);
+    if (exact != null) return exact;
+    final candidates = manifest.hls
+        .whereType<HlsVideoStreamInfo>()
+        .where((s) => s.videoResolution.height <= height)
+        .toList()
+      ..sort(
+        (a, b) =>
+            b.videoResolution.height.compareTo(a.videoResolution.height),
+      );
+    if (candidates.isNotEmpty) return candidates.first;
+    final any = manifest.hls.whereType<HlsVideoStreamInfo>().toList()
+      ..sort(
+        (a, b) =>
+            b.videoResolution.height.compareTo(a.videoResolution.height),
+      );
+    return any.isEmpty ? null : any.first;
+  }
 
   HlsAudioStreamInfo? hlsAudio(StreamManifest manifest) =>
       _bestHlsAudio(manifest);

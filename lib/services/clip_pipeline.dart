@@ -72,22 +72,7 @@ class ClipPipeline {
       final hlsAudio = yt.hlsAudio(m0);
 
       final smallAudio = p.join(workDir.path, 'audio_small.m4a');
-      if (muxForAudio != null) {
-        final muxPath = p.join(workDir.path, 'mux_audio_src.mp4');
-        await YtStreamDownloader.download(
-          muxForAudio,
-          muxPath,
-          yt: yt.client,
-          onBytes: (r, t) {
-            final f = t <= 0 ? 0.0 : r / t;
-            emit('Mengunduh audio...', 0.08 + 0.18 * f);
-          },
-        );
-        await _ffmpeg([
-          '-y', '-i', muxPath, '-vn', '-c:a', 'aac', '-b:a', '64k',
-          '-ac', '1', '-ar', '16000', smallAudio,
-        ]);
-      } else if (hlsAudio != null) {
+      if (hlsAudio != null) {
         final aPath = p.join(workDir.path, 'hls_a.ts');
         await YtStreamDownloader.download(
           hlsAudio,
@@ -100,6 +85,21 @@ class ClipPipeline {
         );
         await _ffmpeg([
           '-y', '-i', aPath, '-vn', '-c:a', 'aac', '-b:a', '64k',
+          '-ac', '1', '-ar', '16000', smallAudio,
+        ]);
+      } else if (muxForAudio != null) {
+        final muxPath = p.join(workDir.path, 'mux_audio_src.mp4');
+        await YtStreamDownloader.download(
+          muxForAudio,
+          muxPath,
+          yt: yt.client,
+          onBytes: (r, t) {
+            final f = t <= 0 ? 0.0 : r / t;
+            emit('Mengunduh audio...', 0.08 + 0.18 * f);
+          },
+        );
+        await _ffmpeg([
+          '-y', '-i', muxPath, '-vn', '-c:a', 'aac', '-b:a', '64k',
           '-ac', '1', '-ar', '16000', smallAudio,
         ]);
       } else {
@@ -128,14 +128,8 @@ class ClipPipeline {
       final m1 = await yt.getManifest(video.id.value);
       final sourcePath = p.join(workDir.path, 'source.mp4');
       final height = option.height.clamp(360, 1080);
-      final hlsV = yt.hlsVideoAt(m1, height) ??
-          yt.hlsVideoAt(m1, 720) ??
-          yt.hlsVideoAt(m1, 480);
+      final hlsV = yt.hlsVideoClosest(m1, height);
       final hlsA = yt.hlsAudio(m1);
-      final videoOnly = yt.videoOnlyAt(m1, height) ??
-          yt.videoOnlyAt(m1, 720) ??
-          yt.videoOnlyAt(m1, 480);
-      final audioOnly = yt.bestAudio(m1);
       final muxed = yt.muxedAt(m1, height) ??
           (m1.muxed.isEmpty
               ? null
@@ -170,32 +164,6 @@ class ClipPipeline {
           '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
           '-movflags', '+faststart', sourcePath,
         ]);
-      } else if (videoOnly != null && audioOnly != null) {
-        final vPath = p.join(workDir.path, 'src_v.${videoOnly.container.name}');
-        final aPath = p.join(workDir.path, 'src_a.${audioOnly.container.name}');
-        await YtStreamDownloader.download(
-          videoOnly,
-          vPath,
-          yt: yt.client,
-          onBytes: (r, t) {
-            final f = t <= 0 ? 0.0 : r / t;
-            emit('Video sumber...', 0.55 + 0.12 * f);
-          },
-        );
-        await YtStreamDownloader.download(
-          audioOnly,
-          aPath,
-          yt: yt.client,
-          onBytes: (r, t) {
-            final f = t <= 0 ? 0.0 : r / t;
-            emit('Audio sumber...', 0.67 + 0.08 * f);
-          },
-        );
-        await _ffmpeg([
-          '-y', '-i', vPath, '-i', aPath,
-          '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
-          '-movflags', '+faststart', sourcePath,
-        ]);
       } else if (muxed != null) {
         await YtStreamDownloader.download(
           muxed,
@@ -207,7 +175,7 @@ class ClipPipeline {
           },
         );
       } else {
-        throw Exception('Tidak ada stream sumber.');
+        throw Exception('Tidak ada stream sumber (HLS/muxed).');
       }
 
       final clips = <HookClip>[];
