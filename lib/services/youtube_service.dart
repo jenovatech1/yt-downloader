@@ -209,7 +209,7 @@ class YoutubeService {
 
   YoutubeExplode get client => _yt;
 
-  /// Manifest: iOS dulu (ada HLS anti-stuck), lalu VR / sdkless.
+  /// Manifest: ANDROID_VR dulu (progressive + NewPipe range=), lalu iOS/sdkless.
   Future<StreamManifest> getManifest(String videoId) async {
     Object? lastError;
 
@@ -217,8 +217,8 @@ class YoutubeService {
       return await _yt.videos.streamsClient.getManifest(
         videoId,
         ytClients: [
-          YoutubeApiClient.ios,
           YoutubeApiClient.androidVr,
+          YoutubeApiClient.ios,
           YoutubeApiClient.androidSdkless,
         ],
       );
@@ -301,24 +301,7 @@ class YoutubeService {
     for (final height in heights) {
       if (usedHeights.contains(height)) continue;
 
-      // 1) HLS (iOS) — paling stabil unduh di HP.
-      final hlsV = _bestHlsVideoAt(manifest, height);
-      if (hlsV != null && hlsAudio != null) {
-        usedHeights.add(height);
-        options.add(
-          DownloadOption(
-            label: _qualityLabel(hlsV.qualityLabel, height),
-            height: height,
-            totalBytes: hlsV.size.totalBytes + hlsAudio.size.totalBytes,
-            isMuxed: false,
-            hlsVideo: hlsV,
-            hlsAudio: hlsAudio,
-          ),
-        );
-        continue;
-      }
-
-      // 2) Adaptive progressive.
+      // 1) Adaptive progressive (NewPipe range=) — prefer 480+.
       final videoOnly = _bestVideoOnlyAt(manifest, height);
       if (videoOnly != null && audio != null && height >= 480) {
         usedHeights.add(height);
@@ -330,6 +313,25 @@ class YoutubeService {
             isMuxed: false,
             videoOnly: videoOnly,
             audioOnly: audio,
+            hlsVideo: _bestHlsVideoAt(manifest, height),
+            hlsAudio: hlsAudio,
+          ),
+        );
+        continue;
+      }
+
+      // 2) HLS fallback.
+      final hlsV = _bestHlsVideoAt(manifest, height);
+      if (hlsV != null && hlsAudio != null) {
+        usedHeights.add(height);
+        options.add(
+          DownloadOption(
+            label: _qualityLabel(hlsV.qualityLabel, height),
+            height: height,
+            totalBytes: hlsV.size.totalBytes + hlsAudio.size.totalBytes,
+            isMuxed: false,
+            hlsVideo: hlsV,
+            hlsAudio: hlsAudio,
           ),
         );
         continue;
@@ -436,7 +438,7 @@ class YoutubeService {
     return candidates.isEmpty ? null : candidates.first;
   }
 
-  /// Dipakai Get Clip — hanya via library get() (bukan HTTP plain).
+  /// Dipakai Get Clip — NewPipe-style range= via [YtStreamDownloader].
   Future<void> downloadToFile(
     StreamInfo info,
     String path, {
