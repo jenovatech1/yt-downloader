@@ -305,80 +305,34 @@ class YoutubeService {
     return null;
   }
 
+  /// Kualitas tetap 1080/720/480/360 — unduh via yt-dlp (bukan stream URL explode).
   Future<List<DownloadOption>> getDownloadOptions(String videoId) async {
-    final manifest = await getManifest(videoId);
-    final audio = _bestAudio(manifest);
-    final hlsAudio = _bestHlsAudio(manifest);
-    final options = <DownloadOption>[];
-    final usedHeights = <int>{};
-
-    final heights = <int>{
-      ...manifest.muxed.map((s) => s.videoResolution.height),
-      ...manifest.videoOnly.map((s) => s.videoResolution.height),
-      ...manifest.hls
-          .whereType<HlsVideoStreamInfo>()
-          .map((s) => s.videoResolution.height),
-    }.where((h) => h > 0 && h <= 1080).toList()
-      ..sort((a, b) => b.compareTo(a));
-
-    for (final height in heights) {
-      if (usedHeights.contains(height)) continue;
-
-      // 1) HLS HD (iOS)
-      final hlsV = _bestHlsVideoAt(manifest, height);
-      if (hlsV != null && hlsAudio != null) {
-        usedHeights.add(height);
-        options.add(
-          DownloadOption(
-            label: _qualityLabel(hlsV.qualityLabel, height),
-            height: height,
-            totalBytes: hlsV.size.totalBytes + hlsAudio.size.totalBytes,
-            isMuxed: false,
-            hlsVideo: hlsV,
-            hlsAudio: hlsAudio,
-            videoOnly: _bestVideoOnlyAt(manifest, height),
-            audioOnly: audio,
-          ),
-        );
-        continue;
-      }
-
-      // 2) Adaptive progressive HD (android_sdkless) — WAJIB untuk 720/1080
-      //    kalau HLS tidak ada di device.
-      final videoOnly = _bestVideoOnlyAt(manifest, height);
-      if (videoOnly != null && audio != null && height >= 480) {
-        usedHeights.add(height);
-        options.add(
-          DownloadOption(
-            label: _qualityLabel(videoOnly.qualityLabel, height),
-            height: height,
-            totalBytes: videoOnly.size.totalBytes + audio.size.totalBytes,
-            isMuxed: false,
-            videoOnly: videoOnly,
-            audioOnly: audio,
-          ),
-        );
-        continue;
-      }
-
-      // 3) Muxed ≤360p
-      final muxed = _bestMuxedAt(manifest, height);
-      if (muxed != null) {
-        usedHeights.add(height);
-        options.add(
-          DownloadOption(
-            label: _qualityLabel(muxed.qualityLabel, height),
-            height: height,
-            totalBytes: muxed.size.totalBytes,
-            isMuxed: true,
-            muxed: muxed,
-          ),
-        );
-      }
-    }
-
-    options.sort((a, b) => b.height.compareTo(a.height));
-    return options;
+    return const [
+      DownloadOption(
+        label: '1080p',
+        height: 1080,
+        totalBytes: 0,
+        isMuxed: false,
+      ),
+      DownloadOption(
+        label: '720p',
+        height: 720,
+        totalBytes: 0,
+        isMuxed: false,
+      ),
+      DownloadOption(
+        label: '480p',
+        height: 480,
+        totalBytes: 0,
+        isMuxed: false,
+      ),
+      DownloadOption(
+        label: '360p',
+        height: 360,
+        totalBytes: 0,
+        isMuxed: true,
+      ),
+    ];
   }
 
   String _qualityLabel(String raw, int height) {

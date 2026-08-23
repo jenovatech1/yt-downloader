@@ -43,10 +43,20 @@ android {
 
     packaging {
         jniLibs {
+            useLegacyPackaging = true
+            keepDebugSymbols += setOf(
+                "**/libffmpeg.zip.so",
+                "**/libpython.zip.so",
+                "**/libaria2c.zip.so",
+                "**/libc++_shared.so",
+            )
             excludes += setOf(
                 "**/armeabi-v7a/**",
                 "**/x86/**",
                 "**/x86_64/**",
+            )
+            pickFirsts += setOf(
+                "**/libc++_shared.so",
             )
         }
     }

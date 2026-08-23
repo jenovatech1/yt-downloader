@@ -26,6 +26,7 @@ class DownloadOption {
   bool get hasHls => hlsVideo != null && hlsAudio != null;
 
   String get sizeLabel {
+    if (totalBytes <= 0) return 'yt-dlp';
     final mb = totalBytes / (1024 * 1024);
     if (mb >= 1024) {
       return '${(mb / 1024).toStringAsFixed(1)} GB';
