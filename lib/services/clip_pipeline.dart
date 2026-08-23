@@ -130,6 +130,10 @@ class ClipPipeline {
       final height = option.height.clamp(360, 1080);
       final hlsV = yt.hlsVideoClosest(m1, height);
       final hlsA = yt.hlsAudio(m1);
+      final videoOnly = yt.videoOnlyAt(m1, height) ??
+          yt.videoOnlyAt(m1, 720) ??
+          yt.videoOnlyAt(m1, 480);
+      final audioOnly = yt.bestAudio(m1);
       final muxed = yt.muxedAt(m1, height) ??
           (m1.muxed.isEmpty
               ? null
@@ -141,22 +145,77 @@ class ClipPipeline {
       if (hlsV != null && hlsA != null) {
         final vPath = p.join(workDir.path, 'src_v.ts');
         final aPath = p.join(workDir.path, 'src_a.ts');
+        try {
+          await YtStreamDownloader.download(
+            hlsV,
+            vPath,
+            yt: yt.client,
+            onBytes: (r, t) {
+              final f = t <= 0 ? 0.0 : r / t;
+              emit('Video sumber HLS...', 0.55 + 0.12 * f);
+            },
+          );
+          await YtStreamDownloader.download(
+            hlsA,
+            aPath,
+            yt: yt.client,
+            onBytes: (r, t) {
+              final f = t <= 0 ? 0.0 : r / t;
+              emit('Audio sumber HLS...', 0.67 + 0.08 * f);
+            },
+          );
+          await _ffmpeg([
+            '-y', '-i', vPath, '-i', aPath,
+            '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
+            '-movflags', '+faststart', sourcePath,
+          ]);
+        } catch (_) {
+          if (videoOnly == null || audioOnly == null) rethrow;
+          final v2 = p.join(workDir.path, 'src_v.${videoOnly.container.name}');
+          final a2 = p.join(workDir.path, 'src_a.${audioOnly.container.name}');
+          await YtStreamDownloader.download(
+            videoOnly,
+            v2,
+            yt: yt.client,
+            onBytes: (r, t) {
+              final f = t <= 0 ? 0.0 : r / t;
+              emit('Video sumber...', 0.55 + 0.12 * f);
+            },
+          );
+          await YtStreamDownloader.download(
+            audioOnly,
+            a2,
+            yt: yt.client,
+            onBytes: (r, t) {
+              final f = t <= 0 ? 0.0 : r / t;
+              emit('Audio sumber...', 0.67 + 0.08 * f);
+            },
+          );
+          await _ffmpeg([
+            '-y', '-i', v2, '-i', a2,
+            '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
+            '-movflags', '+faststart', sourcePath,
+          ]);
+        }
+      } else if (videoOnly != null && audioOnly != null) {
+        final vPath = p.join(workDir.path, 'src_v.${videoOnly.container.name}');
+        final aPath = p.join(workDir.path, 'src_a.${audioOnly.container.name}');
         await YtStreamDownloader.download(
-          hlsV,
+          videoOnly,
           vPath,
           yt: yt.client,
           onBytes: (r, t) {
             final f = t <= 0 ? 0.0 : r / t;
-            emit('Video sumber HLS...', 0.55 + 0.12 * f);
+            emit('Video sumber...', 0.55 + 0.12 * f);
           },
         );
         await YtStreamDownloader.download(
-          hlsA,
+          audioOnly,
           aPath,
           yt: yt.client,
           onBytes: (r, t) {
             final f = t <= 0 ? 0.0 : r / t;
-            emit('Audio sumber HLS...', 0.67 + 0.08 * f);
+            emit('Audio sumber...', 0.67 + 0.08 * f);
           },
         );
         await _ffmpeg([
@@ -175,7 +234,7 @@ class ClipPipeline {
           },
         );
       } else {
-        throw Exception('Tidak ada stream sumber (HLS/muxed).');
+        throw Exception('Tidak ada stream sumber HD.');
       }
 
       final clips = <HookClip>[];

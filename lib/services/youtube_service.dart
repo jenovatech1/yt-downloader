@@ -209,7 +209,8 @@ class YoutubeService {
 
   YoutubeExplode get client => _yt;
 
-  /// Manifest: iOS wajib (HLS). Client lain hanya pelengkap muxed rendah.
+  /// Best practice 23 Agu 2026 (youtube_explode + yt-dlp):
+  /// ios → HLS HD; androidSdkless → progressive HD tanpa PO token.
   Future<StreamManifest> getManifest(String videoId) async {
     Object? lastError;
 
@@ -226,11 +227,16 @@ class YoutubeService {
     }
 
     try {
-      final m = await _yt.videos.streamsClient.getManifest(
+      return await _yt.videos.streamsClient.getManifest(
         videoId,
         ytClients: [YoutubeApiClient.ios],
       );
-      if (m.hls.isNotEmpty || m.muxed.isNotEmpty) return m;
+    } catch (e) {
+      lastError = e;
+    }
+
+    try {
+      return await getAndroidManifest(videoId);
     } catch (e) {
       lastError = e;
     }
@@ -248,6 +254,14 @@ class YoutubeService {
     }
 
     throw Exception('Stream tidak tersedia untuk video ini: $lastError');
+  }
+
+  /// Progressive HD: client android_sdkless saja (c=ANDROID, Range header).
+  Future<StreamManifest> getAndroidManifest(String videoId) {
+    return _yt.videos.streamsClient.getManifest(
+      videoId,
+      ytClients: [YoutubeApiClient.androidSdkless],
+    );
   }
 
   /// Ambil ulang opsi download dengan URL fresh untuk [height].
@@ -293,6 +307,7 @@ class YoutubeService {
 
   Future<List<DownloadOption>> getDownloadOptions(String videoId) async {
     final manifest = await getManifest(videoId);
+    final audio = _bestAudio(manifest);
     final hlsAudio = _bestHlsAudio(manifest);
     final options = <DownloadOption>[];
     final usedHeights = <int>{};
@@ -309,7 +324,7 @@ class YoutubeService {
     for (final height in heights) {
       if (usedHeights.contains(height)) continue;
 
-      // 1) HLS only for HD — progressive adaptive 403 di banyak CDN HP (2026).
+      // 1) HLS HD (iOS)
       final hlsV = _bestHlsVideoAt(manifest, height);
       if (hlsV != null && hlsAudio != null) {
         usedHeights.add(height);
@@ -321,12 +336,32 @@ class YoutubeService {
             isMuxed: false,
             hlsVideo: hlsV,
             hlsAudio: hlsAudio,
+            videoOnly: _bestVideoOnlyAt(manifest, height),
+            audioOnly: audio,
           ),
         );
         continue;
       }
 
-      // 2) Muxed (biasanya ≤360p).
+      // 2) Adaptive progressive HD (android_sdkless) — WAJIB untuk 720/1080
+      //    kalau HLS tidak ada di device.
+      final videoOnly = _bestVideoOnlyAt(manifest, height);
+      if (videoOnly != null && audio != null && height >= 480) {
+        usedHeights.add(height);
+        options.add(
+          DownloadOption(
+            label: _qualityLabel(videoOnly.qualityLabel, height),
+            height: height,
+            totalBytes: videoOnly.size.totalBytes + audio.size.totalBytes,
+            isMuxed: false,
+            videoOnly: videoOnly,
+            audioOnly: audio,
+          ),
+        );
+        continue;
+      }
+
+      // 3) Muxed ≤360p
       final muxed = _bestMuxedAt(manifest, height);
       if (muxed != null) {
         usedHeights.add(height);
@@ -374,6 +409,12 @@ class YoutubeService {
         .where((s) => s.videoResolution.height == height)
         .toList()
       ..sort((a, b) {
+        // Prefer ANDROID (sdkless) — Range header stabil; IOS progressive sering bermasalah.
+        final ac = (a.url.queryParameters['c'] ?? '').toUpperCase();
+        final bc = (b.url.queryParameters['c'] ?? '').toUpperCase();
+        final aScore = ac == 'ANDROID' ? 3 : (ac.contains('ANDROID') ? 2 : 0);
+        final bScore = bc == 'ANDROID' ? 3 : (bc.contains('ANDROID') ? 2 : 0);
+        if (aScore != bScore) return bScore - aScore;
         final codecScore = _videoCodecScore(b.videoCodec) -
             _videoCodecScore(a.videoCodec);
         if (codecScore != 0) return codecScore;

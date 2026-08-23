@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
 import 'yt_stream_downloader.dart';

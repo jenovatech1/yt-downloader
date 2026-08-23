@@ -4,25 +4,25 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
-/// Downloader berdasarkan riset Seal / NewPipe / yt-dlp (Agu 2026):
+/// Best practice 23 Agu 2026 (youtube_explode docs + yt-dlp android_sdkless):
 ///
-/// - Progressive adaptive (`android_vr` videoplayback + range) sering **HTTP 403**
-///   di CDN HP — masalah industri (yt-dlp#17456, Seal#2414). Jangan dipakai.
-/// - Seal = yt-dlp native (crash di device ini sebelumnya).
-/// - NewPipe download = progressive HTTP saja; player pakai YoutubeHttpDataSource.
-/// - Yang masih aman untuk HD di Flutter tanpa yt-dlp: **HLS iOS** (m3u8 segments).
-/// - ≤360p: muxed via [StreamClient.get] (library).
+/// - Muxed max ~360p — jangan andalkan untuk HD.
+/// - HD: **HLS iOS** (m3u8 segments) ATAU **android_sdkless** progressive
+///   dengan HTTP `Range` header (bukan `range=` query — itu sering 403 di HP).
+/// - Jangan rebuild query URL (bisa rusak sig/n).
 class YtStreamDownloader {
   YtStreamDownloader._();
 
-  static const segmentTimeout = Duration(seconds: 40);
-  static const maxRetries = 4;
+  static const chunkBytes = 10379935;
+  static const chunkTimeout = Duration(seconds: 45);
+  static const maxRetries = 5;
 
   static Future<void> download(
     StreamInfo stream,
     String path, {
     YoutubeExplode? yt,
     required void Function(int received, int total) onBytes,
+    FutureOr<StreamInfo> Function()? refreshStream,
   }) async {
     final dest = File(path);
     if (await dest.exists()) await dest.delete();
@@ -40,14 +40,36 @@ class YtStreamDownloader {
       return;
     }
 
-    final client = yt;
-    if (client == null) {
-      throw StateError('YoutubeExplode required for progressive/muxed download');
+    final c = (stream.url.queryParameters['c'] ?? '').toUpperCase();
+    if (c == 'ANDROID') {
+      await _downloadAndroidRange(
+        stream,
+        dest,
+        onBytes: onBytes,
+        refreshStream: refreshStream,
+      );
+      return;
     }
-    await _downloadViaLibrary(client, stream, dest, onBytes: onBytes);
+
+    // ANDROID_VR / IOS progressive / lainnya: append &range= (library style)
+    // atau library get bila yt tersedia.
+    if (yt != null && (c.contains('IOS') || c.isEmpty)) {
+      try {
+        await _downloadViaLibrary(yt, stream, dest, onBytes: onBytes);
+        return;
+      } catch (_) {
+        // fall through to range-param DIY
+      }
+    }
+
+    await _downloadRangeQuery(
+      stream,
+      dest,
+      onBytes: onBytes,
+      refreshStream: refreshStream,
+    );
   }
 
-  /// Library path — hanya untuk muxed kecil; ada stall timeout.
   static Future<void> _downloadViaLibrary(
     YoutubeExplode yt,
     StreamInfo stream,
@@ -59,11 +81,9 @@ class YtStreamDownloader {
     var got = 0;
     try {
       await for (final chunk in yt.videos.streamsClient.get(stream).timeout(
-        const Duration(seconds: 30),
+        const Duration(seconds: 35),
         onTimeout: (s) {
-          s.addError(
-            TimeoutException('Download macet 30s tanpa data'),
-          );
+          s.addError(TimeoutException('Macet 35s tanpa data'));
           s.close();
         },
       )) {
@@ -76,9 +96,161 @@ class YtStreamDownloader {
       await sink.flush();
       await sink.close();
     }
-    if (got < 2048) {
-      throw StateError('File terlalu kecil ($got byte)');
+    if (got < 2048) throw StateError('File terlalu kecil ($got byte)');
+  }
+
+  /// android_sdkless / ANDROID: Range **header** only (youtube_explode rule).
+  static Future<void> _downloadAndroidRange(
+    StreamInfo stream,
+    File dest, {
+    required void Function(int received, int total) onBytes,
+    FutureOr<StreamInfo> Function()? refreshStream,
+  }) async {
+    var info = stream;
+    var total = info.size.totalBytes;
+    if (total <= 0) {
+      throw StateError('Ukuran stream tidak diketahui (itag=${info.tag}).');
     }
+
+    final sink = dest.openWrite();
+    var got = 0;
+    try {
+      while (got < total) {
+        final from = got;
+        final to = (from + chunkBytes < total ? from + chunkBytes : total) - 1;
+        Object? lastError;
+        var ok = false;
+        for (var attempt = 0; attempt < maxRetries && !ok; attempt++) {
+          if (attempt > 0) {
+            await Future<void>.delayed(Duration(milliseconds: 400 * attempt));
+            if (refreshStream != null && attempt >= 1) {
+              try {
+                info = await refreshStream();
+                final n = info.size.totalBytes;
+                if (n > 0) total = n;
+              } catch (_) {}
+            }
+          }
+          final client = http.Client();
+          try {
+            final req = http.Request('GET', info.url);
+            req.headers.addAll({
+              'Range': 'bytes=$from-$to',
+              'user-agent':
+                  'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip',
+              'cookie': 'CONSENT=YES+cb',
+              'accept': '*/*',
+              'accept-language': 'en-US,en;q=0.5',
+            });
+            final res = await client.send(req).timeout(chunkTimeout);
+            if (res.statusCode != 200 && res.statusCode != 206) {
+              throw HttpException('HTTP ${res.statusCode} Range $from-$to');
+            }
+            var chunkGot = 0;
+            await for (final chunk in res.stream.timeout(chunkTimeout)) {
+              if (chunk.isEmpty) continue;
+              sink.add(chunk);
+              got += chunk.length;
+              chunkGot += chunk.length;
+              onBytes(got, total);
+            }
+            if (chunkGot <= 0) throw StateError('Chunk kosong');
+            ok = true;
+          } catch (e) {
+            lastError = e;
+          } finally {
+            client.close();
+          }
+        }
+        if (!ok) {
+          throw StateError(
+            'Gagal unduh HD chunk $from-$to setelah ${maxRetries}x: $lastError',
+          );
+        }
+      }
+    } finally {
+      await sink.flush();
+      await sink.close();
+    }
+    if (got < total) {
+      throw StateError('Download tidak lengkap: $got / $total');
+    }
+    onBytes(total, total);
+  }
+
+  static Future<void> _downloadRangeQuery(
+    StreamInfo stream,
+    File dest, {
+    required void Function(int received, int total) onBytes,
+    FutureOr<StreamInfo> Function()? refreshStream,
+  }) async {
+    var info = stream;
+    var total = info.size.totalBytes;
+    if (total <= 0) {
+      throw StateError('Ukuran stream tidak diketahui (itag=${info.tag}).');
+    }
+    final sink = dest.openWrite();
+    var got = 0;
+    var rn = 0;
+    try {
+      while (got < total) {
+        final from = got;
+        final to = (from + chunkBytes < total ? from + chunkBytes : total) - 1;
+        rn++;
+        Object? lastError;
+        var ok = false;
+        for (var attempt = 0; attempt < maxRetries && !ok; attempt++) {
+          if (attempt > 0) {
+            await Future<void>.delayed(Duration(milliseconds: 400 * attempt));
+            if (refreshStream != null && attempt >= 1) {
+              try {
+                info = await refreshStream();
+                final n = info.size.totalBytes;
+                if (n > 0) total = n;
+              } catch (_) {}
+            }
+          }
+          final client = http.Client();
+          try {
+            var s = info.url.toString();
+            s = s.replaceAll(RegExp(r'&range=[^&]*'), '');
+            s = s.replaceAll(RegExp(r'&rn=[^&]*'), '');
+            s = '$s&range=$from-$to&rn=$rn';
+            final req = http.Request('GET', Uri.parse(s));
+            req.headers.addAll({
+              'user-agent': _ua(info.url),
+              'cookie': 'CONSENT=YES+cb',
+              'accept': '*/*',
+            });
+            final res = await client.send(req).timeout(chunkTimeout);
+            if (res.statusCode != 200 && res.statusCode != 206) {
+              throw HttpException('HTTP ${res.statusCode}');
+            }
+            var chunkGot = 0;
+            await for (final chunk in res.stream.timeout(chunkTimeout)) {
+              if (chunk.isEmpty) continue;
+              sink.add(chunk);
+              got += chunk.length;
+              chunkGot += chunk.length;
+              onBytes(got, total);
+            }
+            if (chunkGot <= 0) throw StateError('Chunk kosong');
+            ok = true;
+          } catch (e) {
+            lastError = e;
+          } finally {
+            client.close();
+          }
+        }
+        if (!ok) {
+          throw StateError('Gagal chunk $from-$to: $lastError');
+        }
+      }
+    } finally {
+      await sink.flush();
+      await sink.close();
+    }
+    onBytes(total, total);
   }
 
   static Future<void> _downloadHls(
@@ -87,24 +259,24 @@ class YtStreamDownloader {
     required void Function(int received, int total) onBytes,
   }) async {
     final client = http.Client();
-    final headers = _iosHeaders();
+    final headers = {
+      'user-agent':
+          'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
+      'accept': '*/*',
+      'cookie': 'CONSENT=YES+cb',
+    };
     try {
       final playlistRes = await client
           .get(stream.url, headers: headers)
           .timeout(const Duration(seconds: 30));
       if (playlistRes.statusCode != 200) {
-        throw HttpException(
-          'HLS playlist HTTP ${playlistRes.statusCode}',
-        );
+        throw HttpException('HLS playlist HTTP ${playlistRes.statusCode}');
       }
-
       var body = playlistRes.body;
       var base = stream.url;
       if (body.contains('#EXT-X-STREAM-INF')) {
-        final media = _firstMediaPlaylistUrl(body, stream.url);
-        if (media == null) {
-          throw StateError('HLS master tanpa media playlist');
-        }
+        final media = _firstMedia(body, stream.url);
+        if (media == null) throw StateError('HLS master tanpa media');
         final mediaRes = await client
             .get(media, headers: headers)
             .timeout(const Duration(seconds: 30));
@@ -114,76 +286,68 @@ class YtStreamDownloader {
         body = mediaRes.body;
         base = media;
       }
-
       final segments = _parseSegments(body, base);
-      if (segments.isEmpty) {
-        throw StateError('HLS playlist kosong / tidak dikenal');
-      }
-
+      if (segments.isEmpty) throw StateError('HLS tanpa segment');
       final sink = dest.openWrite();
       var got = 0;
       final estimated = stream.size.totalBytes;
       try {
         for (var i = 0; i < segments.length; i++) {
-          final bytes = await _getSegment(client, segments[i], headers);
-          sink.add(bytes);
-          got += bytes.length;
-          final totalHint = estimated > 0 ? estimated : got;
-          onBytes(got.clamp(0, totalHint), totalHint);
+          Object? last;
+          var ok = false;
+          for (var a = 0; a < maxRetries && !ok; a++) {
+            if (a > 0) {
+              await Future<void>.delayed(Duration(milliseconds: 300 * a));
+            }
+            try {
+              final res = await client
+                  .get(segments[i], headers: headers)
+                  .timeout(chunkTimeout);
+              if (res.statusCode != 200 || res.bodyBytes.isEmpty) {
+                throw HttpException('Segment HTTP ${res.statusCode}');
+              }
+              sink.add(res.bodyBytes);
+              got += res.bodyBytes.length;
+              ok = true;
+            } catch (e) {
+              last = e;
+            }
+          }
+          if (!ok) throw StateError('Segment $i gagal: $last');
+          final tip = estimated > 0 ? estimated : got;
+          onBytes(got.clamp(0, tip), tip);
         }
       } finally {
         await sink.flush();
         await sink.close();
       }
-      if (got < 2048) {
-        throw StateError('HLS hasil terlalu kecil ($got byte)');
-      }
+      if (got < 2048) throw StateError('HLS terlalu kecil ($got)');
       onBytes(got, got);
     } finally {
       client.close();
     }
   }
 
-  static Future<List<int>> _getSegment(
-    http.Client client,
-    Uri uri,
-    Map<String, String> headers,
-  ) async {
-    Object? last;
-    for (var attempt = 0; attempt < maxRetries; attempt++) {
-      if (attempt > 0) {
-        await Future<void>.delayed(Duration(milliseconds: 400 * attempt));
-      }
-      try {
-        final res =
-            await client.get(uri, headers: headers).timeout(segmentTimeout);
-        if (res.statusCode != 200 || res.bodyBytes.isEmpty) {
-          throw HttpException('Segment HTTP ${res.statusCode}');
-        }
-        return res.bodyBytes;
-      } catch (e) {
-        last = e;
-      }
+  static String _ua(Uri url) {
+    final c = (url.queryParameters['c'] ?? '').toUpperCase();
+    if (c.contains('ANDROID_VR')) {
+      return 'com.google.android.apps.youtube.vr.oculus/1.56.21 '
+          '(Linux; U; Android 12; eureka-user Build/SQ3A.220605.009.A1) gzip';
     }
-    throw StateError('Segment gagal setelah ${maxRetries}x: $last');
+    if (c.contains('IOS')) {
+      return 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)';
+    }
+    return 'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip';
   }
 
-  static Map<String, String> _iosHeaders() => {
-        'user-agent':
-            'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
-        'accept': '*/*',
-        'accept-language': 'en-US,en;q=0.9',
-        'cookie': 'CONSENT=YES+cb',
-      };
-
-  static Uri? _firstMediaPlaylistUrl(String master, Uri base) {
+  static Uri? _firstMedia(String master, Uri base) {
     final lines = master.split('\n');
     for (var i = 0; i < lines.length; i++) {
       if (!lines[i].trim().startsWith('#EXT-X-STREAM-INF')) continue;
       for (var j = i + 1; j < lines.length; j++) {
-        final next = lines[j].trim();
-        if (next.isEmpty || next.startsWith('#')) continue;
-        return base.resolve(next);
+        final n = lines[j].trim();
+        if (n.isEmpty || n.startsWith('#')) continue;
+        return base.resolve(n);
       }
     }
     return null;
