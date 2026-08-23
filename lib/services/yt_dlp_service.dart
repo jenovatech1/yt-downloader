@@ -92,7 +92,8 @@ class YtDlpService {
         sectionEnd > sectionStart) {
       custom['--download-sections'] =
           '*${sectionStart.toStringAsFixed(3)}-${sectionEnd.toStringAsFixed(3)}';
-      custom['--force-keyframes-at-cuts'] = 'true';
+      // Flag tanpa argumen — JANGAN kasih 'true' (yt-dlp anggap URL).
+      custom['--force-keyframes-at-cuts'] = null;
     }
 
     final tracker = _ProgressTracker(
