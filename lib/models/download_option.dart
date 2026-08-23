@@ -9,6 +9,8 @@ class DownloadOption {
     this.muxed,
     this.videoOnly,
     this.audioOnly,
+    this.hlsVideo,
+    this.hlsAudio,
   });
 
   final String label;
@@ -18,6 +20,10 @@ class DownloadOption {
   final MuxedStreamInfo? muxed;
   final VideoOnlyStreamInfo? videoOnly;
   final AudioOnlyStreamInfo? audioOnly;
+  final HlsVideoStreamInfo? hlsVideo;
+  final HlsAudioStreamInfo? hlsAudio;
+
+  bool get hasHls => hlsVideo != null && hlsAudio != null;
 
   String get sizeLabel {
     final mb = totalBytes / (1024 * 1024);

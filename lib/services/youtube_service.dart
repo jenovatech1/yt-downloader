@@ -209,7 +209,7 @@ class YoutubeService {
 
   YoutubeExplode get client => _yt;
 
-  /// Manifest: androidVr dulu (yt-dlp style, tanpa PO token), lalu fallback.
+  /// Manifest: iOS dulu (ada HLS anti-stuck), lalu VR / sdkless.
   Future<StreamManifest> getManifest(String videoId) async {
     Object? lastError;
 
@@ -217,9 +217,9 @@ class YoutubeService {
       return await _yt.videos.streamsClient.getManifest(
         videoId,
         ytClients: [
+          YoutubeApiClient.ios,
           YoutubeApiClient.androidVr,
           YoutubeApiClient.androidSdkless,
-          YoutubeApiClient.ios,
         ],
       );
     } catch (e) {
@@ -230,7 +230,8 @@ class YoutubeService {
       final m = await _yt.videos.streamsClient.getManifest(videoId);
       if (m.audioOnly.isNotEmpty ||
           m.videoOnly.isNotEmpty ||
-          m.muxed.isNotEmpty) {
+          m.muxed.isNotEmpty ||
+          m.hls.isNotEmpty) {
         return m;
       }
     } catch (e) {
@@ -284,22 +285,41 @@ class YoutubeService {
   Future<List<DownloadOption>> getDownloadOptions(String videoId) async {
     final manifest = await getManifest(videoId);
     final audio = _bestAudio(manifest);
+    final hlsAudio = _bestHlsAudio(manifest);
     final options = <DownloadOption>[];
     final usedHeights = <int>{};
 
     final heights = <int>{
       ...manifest.muxed.map((s) => s.videoResolution.height),
       ...manifest.videoOnly.map((s) => s.videoResolution.height),
-    }.where((h) => h > 0).toList()
+      ...manifest.hls
+          .whereType<HlsVideoStreamInfo>()
+          .map((s) => s.videoResolution.height),
+    }.where((h) => h > 0 && h <= 1080).toList()
       ..sort((a, b) => b.compareTo(a));
 
     for (final height in heights) {
       if (usedHeights.contains(height)) continue;
 
-      final videoOnly = _bestVideoOnlyAt(manifest, height);
-      final muxed = _bestMuxedAt(manifest, height);
+      // 1) HLS (iOS) — paling stabil unduh di HP.
+      final hlsV = _bestHlsVideoAt(manifest, height);
+      if (hlsV != null && hlsAudio != null) {
+        usedHeights.add(height);
+        options.add(
+          DownloadOption(
+            label: _qualityLabel(hlsV.qualityLabel, height),
+            height: height,
+            totalBytes: hlsV.size.totalBytes + hlsAudio.size.totalBytes,
+            isMuxed: false,
+            hlsVideo: hlsV,
+            hlsAudio: hlsAudio,
+          ),
+        );
+        continue;
+      }
 
-      // Prefer adaptive (video+audio) untuk kualitas akurat; muxed max ~360p.
+      // 2) Adaptive progressive.
+      final videoOnly = _bestVideoOnlyAt(manifest, height);
       if (videoOnly != null && audio != null && height >= 480) {
         usedHeights.add(height);
         options.add(
@@ -315,6 +335,8 @@ class YoutubeService {
         continue;
       }
 
+      // 3) Muxed (biasanya ≤360p).
+      final muxed = _bestMuxedAt(manifest, height);
       if (muxed != null) {
         usedHeights.add(height);
         options.add(
@@ -392,6 +414,27 @@ class YoutubeService {
 
   MuxedStreamInfo? muxedAt(StreamManifest manifest, int height) =>
       _bestMuxedAt(manifest, height);
+
+  HlsVideoStreamInfo? hlsVideoAt(StreamManifest manifest, int height) =>
+      _bestHlsVideoAt(manifest, height);
+
+  HlsAudioStreamInfo? hlsAudio(StreamManifest manifest) =>
+      _bestHlsAudio(manifest);
+
+  HlsVideoStreamInfo? _bestHlsVideoAt(StreamManifest manifest, int height) {
+    final candidates = manifest.hls
+        .whereType<HlsVideoStreamInfo>()
+        .where((s) => s.videoResolution.height == height)
+        .toList()
+      ..sort((a, b) => b.bitrate.compareTo(a.bitrate));
+    return candidates.isEmpty ? null : candidates.first;
+  }
+
+  HlsAudioStreamInfo? _bestHlsAudio(StreamManifest manifest) {
+    final candidates = manifest.hls.whereType<HlsAudioStreamInfo>().toList()
+      ..sort((a, b) => b.bitrate.compareTo(a.bitrate));
+    return candidates.isEmpty ? null : candidates.first;
+  }
 
   /// Dipakai Get Clip — hanya via library get() (bukan HTTP plain).
   Future<void> downloadToFile(
