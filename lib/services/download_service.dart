@@ -59,8 +59,29 @@ class DownloadService {
       final muxTooLow = option.height >= 720 &&
           muxed != null &&
           muxed.videoResolution.height < option.height - 80;
+      final canHls = hlsVideo != null && hlsAudio != null;
 
-      // === Jalur A: muxed (≤360p, atau adaptive tidak ada) ===
+      // === Jalur A: HLS DIY segments (paling tahan 403 di HP) ===
+      if (canHls && !option.isMuxed) {
+        try {
+          return await _downloadHlsPair(
+            hlsVideo,
+            hlsAudio,
+            tempDir.path,
+            stamp,
+            option.label,
+            outputPath,
+            temps,
+            emit,
+            onProgress,
+            safeTitle,
+          );
+        } catch (_) {
+          // lanjut progressive / muxed
+        }
+      }
+
+      // === Jalur B: muxed (≤360p, atau adaptive tidak ada) ===
       if (muxed != null && (option.isMuxed || !canAdaptive) && !muxTooLow) {
         final rawPath =
             p.join(tempDir.path, 'raw_$stamp.${muxed.container.name}');
@@ -88,7 +109,7 @@ class DownloadService {
         );
       }
 
-      // === Jalur B: adaptive progressive (NewPipe range=) — prefer 720/1080 ===
+      // === Jalur C: adaptive progressive (fix range + flip mode on 403) ===
       if (canAdaptive) {
         final videoPath =
             p.join(tempDir.path, 'v_$stamp.${videoOnly.container.name}');
@@ -141,44 +162,19 @@ class DownloadService {
         );
       }
 
-      // === Jalur C: HLS fallback ===
-      if (hlsVideo != null && hlsAudio != null) {
-        final videoPath = p.join(tempDir.path, 'hv_$stamp.ts');
-        final audioPath = p.join(tempDir.path, 'ha_$stamp.ts');
-        temps.addAll([videoPath, audioPath]);
-
-        emit('Mengunduh video HLS ${option.label}...', 0.05);
-        await YtStreamDownloader.download(
+      // === Jalur D: HLS kalau belum dicoba (muxed-only option) ===
+      if (canHls) {
+        return await _downloadHlsPair(
           hlsVideo,
-          videoPath,
-          onBytes: (r, t) => emit(
-            'Mengunduh video HLS...',
-            0.05 + 0.55 * (t <= 0 ? 0 : r / t),
-            downloaded: r,
-            total: t,
-          ),
-        );
-        emit('Mengunduh audio HLS...', 0.62);
-        await YtStreamDownloader.download(
           hlsAudio,
-          audioPath,
-          onBytes: (r, t) => emit(
-            'Mengunduh audio HLS...',
-            0.62 + 0.28 * (t <= 0 ? 0 : r / t),
-            downloaded: r,
-            total: t,
-          ),
-        );
-        emit('Menggabungkan...', 0.92);
-        await _merge(videoPath, audioPath, outputPath);
-        final total = hlsVideo.size.totalBytes + hlsAudio.size.totalBytes;
-        return await _finish(
-          outputPath,
-          safeTitle,
+          tempDir.path,
           stamp,
-          total,
-          onProgress,
+          option.label,
+          outputPath,
+          temps,
           emit,
+          onProgress,
+          safeTitle,
         );
       }
 
@@ -189,6 +185,57 @@ class DownloadService {
       }
       await _safeDelete(outputPath);
     }
+  }
+
+  Future<String> _downloadHlsPair(
+    HlsVideoStreamInfo hlsVideo,
+    HlsAudioStreamInfo hlsAudio,
+    String tempDir,
+    int stamp,
+    String label,
+    String outputPath,
+    List<String> temps,
+    void Function(String, double, {int downloaded, int total}) emit,
+    DetailedProgressCallback onProgress,
+    String safeTitle,
+  ) async {
+    final videoPath = p.join(tempDir, 'hv_$stamp.ts');
+    final audioPath = p.join(tempDir, 'ha_$stamp.ts');
+    temps.addAll([videoPath, audioPath]);
+
+    emit('Mengunduh video HLS $label...', 0.05);
+    await YtStreamDownloader.download(
+      hlsVideo,
+      videoPath,
+      onBytes: (r, t) => emit(
+        'Mengunduh video HLS...',
+        0.05 + 0.55 * (t <= 0 ? 0 : r / t),
+        downloaded: r,
+        total: t,
+      ),
+    );
+    emit('Mengunduh audio HLS...', 0.62);
+    await YtStreamDownloader.download(
+      hlsAudio,
+      audioPath,
+      onBytes: (r, t) => emit(
+        'Mengunduh audio HLS...',
+        0.62 + 0.28 * (t <= 0 ? 0 : r / t),
+        downloaded: r,
+        total: t,
+      ),
+    );
+    emit('Menggabungkan...', 0.92);
+    await _merge(videoPath, audioPath, outputPath);
+    final total = hlsVideo.size.totalBytes + hlsAudio.size.totalBytes;
+    return await _finish(
+      outputPath,
+      safeTitle,
+      stamp,
+      total,
+      onProgress,
+      emit,
+    );
   }
 
   Future<String> _finish(

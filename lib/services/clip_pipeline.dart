@@ -128,14 +128,14 @@ class ClipPipeline {
       final m1 = await yt.getManifest(video.id.value);
       final sourcePath = p.join(workDir.path, 'source.mp4');
       final height = option.height.clamp(360, 1080);
-      final videoOnly = yt.videoOnlyAt(m1, height) ??
-          yt.videoOnlyAt(m1, 720) ??
-          yt.videoOnlyAt(m1, 480);
-      final audioOnly = yt.bestAudio(m1);
       final hlsV = yt.hlsVideoAt(m1, height) ??
           yt.hlsVideoAt(m1, 720) ??
           yt.hlsVideoAt(m1, 480);
       final hlsA = yt.hlsAudio(m1);
+      final videoOnly = yt.videoOnlyAt(m1, height) ??
+          yt.videoOnlyAt(m1, 720) ??
+          yt.videoOnlyAt(m1, 480);
+      final audioOnly = yt.bestAudio(m1);
       final muxed = yt.muxedAt(m1, height) ??
           (m1.muxed.isEmpty
               ? null
@@ -144,33 +144,7 @@ class ClipPipeline {
                         .compareTo(a.videoResolution.height)))
                   .first);
 
-      if (videoOnly != null && audioOnly != null) {
-        final vPath = p.join(workDir.path, 'src_v.${videoOnly.container.name}');
-        final aPath = p.join(workDir.path, 'src_a.${audioOnly.container.name}');
-        await YtStreamDownloader.download(
-          videoOnly,
-          vPath,
-          yt: yt.client,
-          onBytes: (r, t) {
-            final f = t <= 0 ? 0.0 : r / t;
-            emit('Video sumber...', 0.55 + 0.12 * f);
-          },
-        );
-        await YtStreamDownloader.download(
-          audioOnly,
-          aPath,
-          yt: yt.client,
-          onBytes: (r, t) {
-            final f = t <= 0 ? 0.0 : r / t;
-            emit('Audio sumber...', 0.67 + 0.08 * f);
-          },
-        );
-        await _ffmpeg([
-          '-y', '-i', vPath, '-i', aPath,
-          '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
-          '-movflags', '+faststart', sourcePath,
-        ]);
-      } else if (hlsV != null && hlsA != null) {
+      if (hlsV != null && hlsA != null) {
         final vPath = p.join(workDir.path, 'src_v.ts');
         final aPath = p.join(workDir.path, 'src_a.ts');
         await YtStreamDownloader.download(
@@ -189,6 +163,32 @@ class ClipPipeline {
           onBytes: (r, t) {
             final f = t <= 0 ? 0.0 : r / t;
             emit('Audio sumber HLS...', 0.67 + 0.08 * f);
+          },
+        );
+        await _ffmpeg([
+          '-y', '-i', vPath, '-i', aPath,
+          '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
+          '-movflags', '+faststart', sourcePath,
+        ]);
+      } else if (videoOnly != null && audioOnly != null) {
+        final vPath = p.join(workDir.path, 'src_v.${videoOnly.container.name}');
+        final aPath = p.join(workDir.path, 'src_a.${audioOnly.container.name}');
+        await YtStreamDownloader.download(
+          videoOnly,
+          vPath,
+          yt: yt.client,
+          onBytes: (r, t) {
+            final f = t <= 0 ? 0.0 : r / t;
+            emit('Video sumber...', 0.55 + 0.12 * f);
+          },
+        );
+        await YtStreamDownloader.download(
+          audioOnly,
+          aPath,
+          yt: yt.client,
+          onBytes: (r, t) {
+            final f = t <= 0 ? 0.0 : r / t;
+            emit('Audio sumber...', 0.67 + 0.08 * f);
           },
         );
         await _ffmpeg([

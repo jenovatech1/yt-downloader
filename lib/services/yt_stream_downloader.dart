@@ -4,22 +4,21 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
-/// YouTube stream downloader — NewPipe-style progressive + DIY HLS.
+/// NewPipe / youtube_explode-compatible progressive + DIY HLS.
 ///
-/// Research (NewPipe YoutubeHttpDataSource / Seal / yt-dlp 2026):
-/// - Progressive `videoplayback` needs `range=start-end` **query param** (+ `rn`),
-///   not only HTTP `Range` header. Wrong method → throttle hang at a few %.
-/// - Match client User-Agent to URL `c=` (ANDROID_VR / IOS / …).
-/// - Never use [StreamClient.get] on Android — hangs on many devices.
-/// - HLS: parse m3u8 → GET each segment with timeout.
+/// Phone 403 fixes:
+/// - `c=ANDROID` → HTTP `Range` header (library rule); else append `&range=`
+///   (NewPipe appends; do **not** rebuild query — can break `sig`/`n`).
+/// - Minimal headers + CONSENT cookie like [YoutubeHttpClient].
+/// - On 403: refresh URL + flip range mode; retry.
 class YtStreamDownloader {
   YtStreamDownloader._();
 
-  static const chunkBytes = 10 * 1024 * 1024;
+  /// Same chunk size as youtube_explode for throttled streams.
+  static const chunkBytes = 10379935;
   static const chunkTimeout = Duration(seconds: 45);
-  static const maxRetries = 4;
+  static const maxRetries = 5;
 
-  /// API dipakai [DownloadService] / [ClipPipeline].
   static Future<void> download(
     StreamInfo stream,
     String path, {
@@ -29,32 +28,21 @@ class YtStreamDownloader {
   }) async {
     final dest = File(path);
     final downloader = _Downloader();
-    try {
-      await downloader.download(
-        stream,
-        dest,
-        onProgress: (p) {
-          final total = stream.size.totalBytes;
-          if (total > 0) {
-            onBytes((p * total).round().clamp(0, total), total);
-          } else {
-            onBytes(0, 1);
-          }
-        },
-        onBytesExact: onBytes,
-        refreshStream: refreshStream,
-      );
-    } finally {
-      // yt owned by caller
-    }
+    await downloader.download(
+      stream,
+      dest,
+      onBytesExact: onBytes,
+      refreshStream: refreshStream,
+    );
   }
 }
+
+enum _RangeMode { queryParam, header }
 
 class _Downloader {
   Future<File> download(
     StreamInfo stream,
     File dest, {
-    void Function(double progress)? onProgress,
     void Function(int received, int total)? onBytesExact,
     FutureOr<StreamInfo> Function()? refreshStream,
   }) async {
@@ -63,17 +51,11 @@ class _Downloader {
 
     final container = stream.container.name.toLowerCase();
     if (container.contains('m3u8') || container.contains('hls')) {
-      return _downloadHls(
-        stream,
-        dest,
-        onProgress: onProgress,
-        onBytesExact: onBytesExact,
-      );
+      return _downloadHls(stream, dest, onBytesExact: onBytesExact);
     }
     return _downloadProgressive(
       stream,
       dest,
-      onProgress: onProgress,
       onBytesExact: onBytesExact,
       refreshStream: refreshStream,
     );
@@ -82,7 +64,6 @@ class _Downloader {
   Future<File> _downloadProgressive(
     StreamInfo stream,
     File dest, {
-    void Function(double progress)? onProgress,
     void Function(int received, int total)? onBytesExact,
     FutureOr<StreamInfo> Function()? refreshStream,
   }) async {
@@ -92,6 +73,8 @@ class _Downloader {
       throw StateError('Ukuran stream tidak diketahui (itag=${info.tag}).');
     }
 
+    // Match youtube_explode: ANDROID → header; else query param.
+    var mode = _preferredMode(info.url);
     final sink = dest.openWrite();
     var got = 0;
     var rn = 0;
@@ -111,25 +94,38 @@ class _Downloader {
             attempt < YtStreamDownloader.maxRetries && !ok;
             attempt++) {
           if (attempt > 0) {
-            await Future<void>.delayed(Duration(milliseconds: 400 * attempt));
-            if (refreshStream != null && attempt >= 2) {
+            await Future<void>.delayed(Duration(milliseconds: 350 * attempt));
+          }
+
+          // 403 → refresh URL ASAP + flip range mode.
+          if (attempt > 0 || lastError.toString().contains('403')) {
+            if (refreshStream != null && attempt >= 1) {
               try {
                 info = await refreshStream();
                 final newTotal = info.size.totalBytes;
                 if (newTotal > 0) total = newTotal;
+                mode = _preferredMode(info.url);
               } catch (_) {}
+            }
+            if (attempt >= 1) {
+              mode = mode == _RangeMode.header
+                  ? _RangeMode.queryParam
+                  : _RangeMode.header;
             }
           }
 
           final client = http.Client();
           try {
-            final req = http.Request('GET', _withRange(info.url, from, to, rn));
-            req.headers.addAll(_headersFor(info.url));
-            final res = await client
-                .send(req)
-                .timeout(YtStreamDownloader.chunkTimeout);
+            final req = _buildRequest(info.url, from, to, rn, mode);
+            final res =
+                await client.send(req).timeout(YtStreamDownloader.chunkTimeout);
+            if (res.statusCode == 403) {
+              throw HttpException('HTTP 403 range $from-$to mode=$mode');
+            }
             if (res.statusCode != 200 && res.statusCode != 206) {
-              throw HttpException('HTTP ${res.statusCode} range $from-$to');
+              throw HttpException(
+                'HTTP ${res.statusCode} range $from-$to mode=$mode',
+              );
             }
 
             var chunkGot = 0;
@@ -139,7 +135,6 @@ class _Downloader {
               sink.add(chunk);
               got += chunk.length;
               chunkGot += chunk.length;
-              onProgress?.call((got / total).clamp(0.0, 1.0));
               onBytesExact?.call(got, total);
             }
             if (chunkGot <= 0) {
@@ -167,22 +162,90 @@ class _Downloader {
     if (got < total) {
       throw StateError('Download tidak lengkap: $got / $total bytes');
     }
-    onProgress?.call(1);
     onBytesExact?.call(total, total);
     return dest;
+  }
+
+  _RangeMode _preferredMode(Uri url) {
+    final c = (url.queryParameters['c'] ?? '').toUpperCase();
+    // Exact youtube_explode rule (only exact ANDROID, not ANDROID_VR).
+    if (c == 'ANDROID') return _RangeMode.header;
+    return _RangeMode.queryParam;
+  }
+
+  http.Request _buildRequest(
+    Uri url,
+    int from,
+    int to,
+    int rn,
+    _RangeMode mode,
+  ) {
+    late final http.Request req;
+    if (mode == _RangeMode.header) {
+      // Strip any existing range query; use header only.
+      var s = url.toString();
+      s = s.replaceAll(RegExp(r'[&?]range=[^&]*'), '');
+      s = s.replaceAll(RegExp(r'[&?]rn=[^&]*'), '');
+      if (s.contains('?&')) s = s.replaceFirst('?&', '?');
+      req = http.Request('GET', Uri.parse(s));
+      req.headers['Range'] = 'bytes=$from-$to';
+    } else {
+      // NewPipe: append &range= &rn= without rebuilding query (preserves sig/n).
+      var s = url.toString();
+      s = s.replaceAll(RegExp(r'&range=[^&]*'), '');
+      s = s.replaceAll(RegExp(r'&rn=[^&]*'), '');
+      s = '$s&range=$from-$to&rn=$rn';
+      req = http.Request('GET', Uri.parse(s));
+    }
+
+    final c = (url.queryParameters['c'] ?? '').toUpperCase();
+    req.headers.addAll({
+      // YoutubeHttpClient defaults — needed on some mobile CDNs.
+      'user-agent': _uaForClient(c),
+      'cookie': 'CONSENT=YES+cb',
+      'accept': '*/*',
+      'accept-language': 'en-US,en;q=0.5',
+    });
+    return req;
+  }
+
+  String _uaForClient(String c) {
+    if (c.contains('ANDROID_VR')) {
+      // Match common VR UA used by extractors (client payload has no UA).
+      return 'com.google.android.apps.youtube.vr.oculus/1.56.21 '
+          '(Linux; U; Android 12; eureka-user Build/SQ3A.220605.009.A1) gzip';
+    }
+    if (c == 'ANDROID') {
+      return 'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip';
+    }
+    if (c.contains('IOS')) {
+      return 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)';
+    }
+    if (c.contains('TV')) {
+      return 'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version,gzip(gfe)';
+    }
+    // Same as YoutubeHttpClient.defaultHeaders
+    return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/96.0.4664.18 Safari/537.36';
   }
 
   Future<File> _downloadHls(
     StreamInfo stream,
     File dest, {
-    void Function(double progress)? onProgress,
     void Function(int received, int total)? onBytesExact,
   }) async {
     final client = http.Client();
     try {
       final playlistUrl = stream.url;
+      final headers = {
+        'user-agent': _uaForClient(
+          (playlistUrl.queryParameters['c'] ?? 'IOS').toUpperCase(),
+        ),
+        'cookie': 'CONSENT=YES+cb',
+        'accept': '*/*',
+      };
       final playlistRes = await client
-          .get(playlistUrl, headers: _headersFor(playlistUrl))
+          .get(playlistUrl, headers: headers)
           .timeout(const Duration(seconds: 30));
       if (playlistRes.statusCode != 200) {
         throw HttpException('HLS playlist HTTP ${playlistRes.statusCode}');
@@ -196,7 +259,7 @@ class _Downloader {
           throw StateError('HLS master tanpa media playlist');
         }
         final mediaRes = await client
-            .get(media, headers: _headersFor(media))
+            .get(media, headers: headers)
             .timeout(const Duration(seconds: 30));
         if (mediaRes.statusCode != 200) {
           throw HttpException('HLS media HTTP ${mediaRes.statusCode}');
@@ -206,112 +269,48 @@ class _Downloader {
       }
 
       final segments = _parseSegments(body, base);
-      return _writeSegments(
-        segments,
-        dest,
-        client,
-        onProgress: onProgress,
-        onBytesExact: onBytesExact,
-        estimatedTotal: stream.size.totalBytes,
-      );
+      if (segments.isEmpty) throw StateError('HLS tanpa segment');
+
+      final sink = dest.openWrite();
+      var got = 0;
+      final estimated = stream.size.totalBytes;
+      try {
+        for (var i = 0; i < segments.length; i++) {
+          Object? lastError;
+          var ok = false;
+          for (var attempt = 0;
+              attempt < YtStreamDownloader.maxRetries && !ok;
+              attempt++) {
+            if (attempt > 0) {
+              await Future<void>.delayed(Duration(milliseconds: 300 * attempt));
+            }
+            try {
+              final res = await client
+                  .get(segments[i], headers: headers)
+                  .timeout(YtStreamDownloader.chunkTimeout);
+              if (res.statusCode != 200 || res.bodyBytes.isEmpty) {
+                throw HttpException('Segment HTTP ${res.statusCode}');
+              }
+              sink.add(res.bodyBytes);
+              got += res.bodyBytes.length;
+              ok = true;
+            } catch (e) {
+              lastError = e;
+            }
+          }
+          if (!ok) throw StateError('Segment $i gagal: $lastError');
+          final totalHint = estimated > 0 ? estimated : got;
+          onBytesExact?.call(got.clamp(0, totalHint), totalHint);
+        }
+      } finally {
+        await sink.flush();
+        await sink.close();
+      }
+      onBytesExact?.call(got, got);
+      return dest;
     } finally {
       client.close();
     }
-  }
-
-  Future<File> _writeSegments(
-    List<Uri> segments,
-    File dest,
-    http.Client client, {
-    void Function(double progress)? onProgress,
-    void Function(int received, int total)? onBytesExact,
-    int estimatedTotal = 0,
-  }) async {
-    if (segments.isEmpty) throw StateError('HLS tanpa segment');
-    final sink = dest.openWrite();
-    var got = 0;
-    try {
-      for (var i = 0; i < segments.length; i++) {
-        final seg = segments[i];
-        Object? lastError;
-        var ok = false;
-        for (var attempt = 0;
-            attempt < YtStreamDownloader.maxRetries && !ok;
-            attempt++) {
-          if (attempt > 0) {
-            await Future<void>.delayed(Duration(milliseconds: 300 * attempt));
-          }
-          try {
-            final res = await client
-                .get(seg, headers: _headersFor(seg))
-                .timeout(YtStreamDownloader.chunkTimeout);
-            if (res.statusCode != 200) {
-              throw HttpException('Segment HTTP ${res.statusCode}');
-            }
-            if (res.bodyBytes.isEmpty) {
-              throw StateError('Segment kosong');
-            }
-            sink.add(res.bodyBytes);
-            got += res.bodyBytes.length;
-            ok = true;
-          } catch (e) {
-            lastError = e;
-          }
-        }
-        if (!ok) {
-          throw StateError('Segment $i gagal: $lastError');
-        }
-        final p = ((i + 1) / segments.length).clamp(0.0, 1.0);
-        onProgress?.call(p);
-        final totalHint = estimatedTotal > 0 ? estimatedTotal : got;
-        onBytesExact?.call(got.clamp(0, totalHint), totalHint);
-      }
-    } finally {
-      await sink.flush();
-      await sink.close();
-    }
-    onProgress?.call(1);
-    onBytesExact?.call(got, got);
-    return dest;
-  }
-
-  Uri _withRange(Uri url, int from, int to, int rn) {
-    final q = Map<String, String>.from(url.queryParameters);
-    q.remove('range');
-    q['range'] = '$from-$to';
-    q['rn'] = '$rn';
-    return url.replace(queryParameters: q);
-  }
-
-  Map<String, String> _headersFor(Uri url) {
-    final c = (url.queryParameters['c'] ?? '').toUpperCase();
-    return {
-      'User-Agent': _uaForClient(c),
-      'Accept': '*/*',
-      'Accept-Encoding': 'identity',
-      'Connection': 'close',
-      'Origin': 'https://www.youtube.com',
-      'Referer': 'https://www.youtube.com/',
-    };
-  }
-
-  String _uaForClient(String c) {
-    if (c.contains('ANDROID_VR')) {
-      return 'com.google.android.apps.youtube.vr.oculus/1.65.10 '
-          '(Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip';
-    }
-    if (c == 'ANDROID' || c.startsWith('ANDROID')) {
-      return 'com.google.android.youtube/20.10.38 '
-          '(Linux; U; Android 12; US) gzip';
-    }
-    if (c.contains('IOS')) {
-      return 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)';
-    }
-    if (c.contains('TVHTML5') || c.contains('TV')) {
-      return 'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version';
-    }
-    return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-        '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
   }
 
   Uri? _firstMediaPlaylistUrl(String master, Uri base) {
@@ -331,14 +330,11 @@ class _Downloader {
 
   List<Uri> _parseSegments(String playlist, Uri base) {
     final out = <Uri>[];
-    final lines = playlist.split('\n');
-    for (var i = 0; i < lines.length; i++) {
-      final line = lines[i].trim();
+    for (final raw in playlist.split('\n')) {
+      final line = raw.trim();
       if (line.startsWith('#EXT-X-MAP:')) {
         final uriMatch = RegExp(r'URI="([^"]+)"').firstMatch(line);
-        if (uriMatch != null) {
-          out.add(base.resolve(uriMatch.group(1)!));
-        }
+        if (uriMatch != null) out.add(base.resolve(uriMatch.group(1)!));
         continue;
       }
       if (line.isEmpty || line.startsWith('#')) continue;
@@ -346,5 +342,4 @@ class _Downloader {
     }
     return out;
   }
-
 }

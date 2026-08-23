@@ -209,7 +209,7 @@ class YoutubeService {
 
   YoutubeExplode get client => _yt;
 
-  /// Manifest: ANDROID_VR dulu (progressive + NewPipe range=), lalu iOS/sdkless.
+  /// Manifest: iOS dulu (HLS), lalu ANDROID_VR / sdkless progressive.
   Future<StreamManifest> getManifest(String videoId) async {
     Object? lastError;
 
@@ -217,8 +217,8 @@ class YoutubeService {
       return await _yt.videos.streamsClient.getManifest(
         videoId,
         ytClients: [
-          YoutubeApiClient.androidVr,
           YoutubeApiClient.ios,
+          YoutubeApiClient.androidVr,
           YoutubeApiClient.androidSdkless,
         ],
       );
@@ -301,26 +301,7 @@ class YoutubeService {
     for (final height in heights) {
       if (usedHeights.contains(height)) continue;
 
-      // 1) Adaptive progressive (NewPipe range=) — prefer 480+.
-      final videoOnly = _bestVideoOnlyAt(manifest, height);
-      if (videoOnly != null && audio != null && height >= 480) {
-        usedHeights.add(height);
-        options.add(
-          DownloadOption(
-            label: _qualityLabel(videoOnly.qualityLabel, height),
-            height: height,
-            totalBytes: videoOnly.size.totalBytes + audio.size.totalBytes,
-            isMuxed: false,
-            videoOnly: videoOnly,
-            audioOnly: audio,
-            hlsVideo: _bestHlsVideoAt(manifest, height),
-            hlsAudio: hlsAudio,
-          ),
-        );
-        continue;
-      }
-
-      // 2) HLS fallback.
+      // 1) HLS (iOS) — segment download tahan 403 progressive di HP.
       final hlsV = _bestHlsVideoAt(manifest, height);
       if (hlsV != null && hlsAudio != null) {
         usedHeights.add(height);
@@ -332,6 +313,25 @@ class YoutubeService {
             isMuxed: false,
             hlsVideo: hlsV,
             hlsAudio: hlsAudio,
+            videoOnly: _bestVideoOnlyAt(manifest, height),
+            audioOnly: audio,
+          ),
+        );
+        continue;
+      }
+
+      // 2) Adaptive progressive.
+      final videoOnly = _bestVideoOnlyAt(manifest, height);
+      if (videoOnly != null && audio != null && height >= 480) {
+        usedHeights.add(height);
+        options.add(
+          DownloadOption(
+            label: _qualityLabel(videoOnly.qualityLabel, height),
+            height: height,
+            totalBytes: videoOnly.size.totalBytes + audio.size.totalBytes,
+            isMuxed: false,
+            videoOnly: videoOnly,
+            audioOnly: audio,
           ),
         );
         continue;
