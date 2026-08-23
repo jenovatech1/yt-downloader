@@ -26,14 +26,25 @@ class DownloadService {
     final workDir = Directory(p.join(tempDir.path, 'ytdlp_$stamp'));
     await workDir.create(recursive: true);
 
-    void emit(String phase, double progress, {int downloaded = 0, int total = 0}) {
+    var lastDownloaded = 0;
+    var lastTotal = option.totalBytes;
+
+    void emit(
+      String phase,
+      double progress, {
+      int downloaded = 0,
+      int total = 0,
+      double speed = 0,
+    }) {
+      if (downloaded > 0) lastDownloaded = downloaded;
+      if (total > 0) lastTotal = total;
       onProgress(
         DownloadProgress(
           phase: phase,
           progress: progress.clamp(0.0, 0.99),
-          downloadedBytes: downloaded,
-          totalBytes: total <= 0 ? 1 : total,
-          speedBytesPerSecond: 0,
+          downloadedBytes: lastDownloaded,
+          totalBytes: lastTotal > 0 ? lastTotal : 1,
+          speedBytesPerSecond: speed,
         ),
       );
     }
@@ -44,16 +55,32 @@ class DownloadService {
         videoId: video.id.value,
         height: option.height,
         outputDir: workDir.path,
-        onProgress: (pct, phase) => emit(phase, 0.05 + 0.88 * pct),
+        estimatedTotalBytes: option.totalBytes,
+        onProgress: (p) => emit(
+          p.phase,
+          0.05 + 0.88 * p.progress01,
+          downloaded: p.downloadedBytes,
+          total: p.totalBytes,
+          speed: p.speedBytesPerSecond,
+        ),
       );
 
       var galleryPath = filePath;
+      final finalSize = await File(filePath).length();
+      lastDownloaded = finalSize;
+      lastTotal = finalSize;
+
       if (p.extension(filePath).toLowerCase() != '.mp4') {
         galleryPath = p.join(workDir.path, 'out_$stamp.mp4');
         await File(filePath).copy(galleryPath);
       }
 
-      emit('Menyimpan ke galeri...', 0.96);
+      emit(
+        'Menyimpan ke galeri...',
+        0.96,
+        downloaded: lastDownloaded,
+        total: lastTotal,
+      );
       if (!File(galleryPath).existsSync() ||
           File(galleryPath).lengthSync() < 2048) {
         throw Exception('File hasil kosong');
@@ -72,8 +99,8 @@ class DownloadService {
         DownloadProgress(
           phase: 'Selesai',
           progress: 1,
-          downloadedBytes: option.totalBytes,
-          totalBytes: option.totalBytes <= 0 ? 1 : option.totalBytes,
+          downloadedBytes: lastDownloaded,
+          totalBytes: lastTotal > 0 ? lastTotal : lastDownloaded,
           speedBytesPerSecond: 0,
           isDone: true,
         ),

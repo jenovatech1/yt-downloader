@@ -305,41 +305,60 @@ class YoutubeService {
     return null;
   }
 
-  /// Kualitas tetap 1080/720/480/360 — unduh via yt-dlp (bukan stream URL explode).
+  /// Kualitas tetap 1080/720/480/360 — unduh via yt-dlp.
+  /// Estimasi ukuran dari explode (kalau tersedia) biar progress bar punya total MB.
   Future<List<DownloadOption>> getDownloadOptions(String videoId) async {
-    return const [
-      DownloadOption(
-        label: '1080p',
-        height: 1080,
-        totalBytes: 0,
-        isMuxed: false,
-      ),
-      DownloadOption(
-        label: '720p',
-        height: 720,
-        totalBytes: 0,
-        isMuxed: false,
-      ),
-      DownloadOption(
-        label: '480p',
-        height: 480,
-        totalBytes: 0,
-        isMuxed: false,
-      ),
-      DownloadOption(
-        label: '360p',
-        height: 360,
-        totalBytes: 0,
-        isMuxed: true,
-      ),
+    const heights = [1080, 720, 480, 360];
+    final sizes = <int, int>{};
+    try {
+      final manifest = await _yt.videos.streamsClient.getManifest(videoId);
+      for (final h in heights) {
+        sizes[h] = _estimateBytes(manifest, h);
+      }
+    } catch (_) {}
+
+    return [
+      for (final h in heights)
+        DownloadOption(
+          label: '${h}p',
+          height: h,
+          totalBytes: sizes[h] ?? 0,
+          isMuxed: h <= 360,
+        ),
     ];
   }
 
-  String _qualityLabel(String raw, int height) {
-    final cleaned = raw.trim();
-    if (cleaned.isEmpty) return '${height}p';
-    return cleaned.contains('p') ? cleaned : '${height}p';
+  int _estimateBytes(StreamManifest manifest, int height) {
+    int bestVideo = 0;
+    for (final v in manifest.videoOnly) {
+      if (v.videoResolution.height <= height &&
+          v.size.totalBytes > bestVideo) {
+        bestVideo = v.size.totalBytes;
+      }
+    }
+    for (final v in manifest.hls.whereType<HlsVideoStreamInfo>()) {
+      if (v.videoResolution.height <= height &&
+          v.size.totalBytes > bestVideo) {
+        bestVideo = v.size.totalBytes;
+      }
+    }
+    int bestAudio = 0;
+    for (final a in manifest.audioOnly) {
+      if (a.size.totalBytes > bestAudio) bestAudio = a.size.totalBytes;
+    }
+    for (final a in manifest.hls.whereType<HlsAudioStreamInfo>()) {
+      if (a.size.totalBytes > bestAudio) bestAudio = a.size.totalBytes;
+    }
+    for (final m in manifest.muxed) {
+      if (m.videoResolution.height <= height &&
+          m.size.totalBytes > bestVideo + bestAudio) {
+        return m.size.totalBytes;
+      }
+    }
+    final total = bestVideo + bestAudio;
+    return total > 0 ? total : 0;
   }
+
 
   Stream<List<int>> openStream(StreamInfo streamInfo) {
     return _yt.videos.streamsClient.get(streamInfo);

@@ -39,14 +39,20 @@ class ClipPipeline {
       throw Exception('Isi API key Groq atau Gemini di Pengaturan dulu.');
     }
 
-    void emit(String phase, double progress) {
+    void emit(
+      String phase,
+      double progress, {
+      int downloaded = 0,
+      int total = 0,
+      double speed = 0,
+    }) {
       onProgress(
         DownloadProgress(
           phase: phase,
           progress: progress.clamp(0, 1),
-          downloadedBytes: 0,
-          totalBytes: 0,
-          speedBytesPerSecond: 0,
+          downloadedBytes: downloaded,
+          totalBytes: total,
+          speedBytesPerSecond: speed,
         ),
       );
     }
@@ -61,7 +67,13 @@ class ClipPipeline {
     final audioPath = await YtDlpService.instance.downloadAudio(
       videoId: video.id.value,
       outputDir: p.join(workDir.path, 'audio'),
-      onProgress: (pct, phase) => emit(phase, 0.08 + 0.24 * pct),
+      onProgress: (p) => emit(
+        p.phase,
+        0.08 + 0.24 * p.progress01,
+        downloaded: p.downloadedBytes,
+        total: p.totalBytes,
+        speed: p.speedBytesPerSecond,
+      ),
     );
 
     emit('Transkrip audio (AI)...', 0.35);
@@ -96,14 +108,16 @@ class ClipPipeline {
         outputDir: clipDir,
         sectionStart: hook.startSec,
         sectionEnd: hook.endSec,
-        onProgress: (pct, phase) {
+        onProgress: (p) {
           emit(
-            'Klip ${i + 1}/${hooks.length}: $phase',
-            0.55 + 0.40 * ((i + pct) / hooks.length),
+            'Klip ${i + 1}/${hooks.length}: ${p.phase}',
+            0.55 + 0.40 * ((i + p.progress01) / hooks.length),
+            downloaded: p.downloadedBytes,
+            total: p.totalBytes,
+            speed: p.speedBytesPerSecond,
           );
         },
       );
-      // Pindah ke path stabil.
       final stable = p.join(
         workDir.path,
         'clip_${i.toString().padLeft(2, '0')}.mp4',

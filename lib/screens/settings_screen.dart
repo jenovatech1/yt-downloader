@@ -71,7 +71,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'Sama seperti Klippod. Groq untuk transkrip, Gemini untuk hook. '
+                  'Sama seperti Klippod. Groq (Whisper + GPT-OSS) untuk transkrip & hook; '
+                  'Gemini cadangan. Model lama llama-3.3 sudah shutdown. '
                   'Kalau salah satu gagal, yang lain dipakai sebagai cadangan.',
                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                     color: Theme.of(context).colorScheme.onSurfaceVariant,

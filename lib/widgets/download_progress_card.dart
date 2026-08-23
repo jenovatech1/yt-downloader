@@ -81,7 +81,7 @@ class DownloadProgressCard extends StatelessWidget {
           ),
           const SizedBox(height: 10),
           Text(
-            'Tip: player otomatis pause saat download. Video + audio diunduh paralel.',
+            'Tip: unduhan via yt-dlp. Progress dari log unduhan (MB / kecepatan).',
             style: theme.textTheme.bodySmall?.copyWith(
               color: theme.colorScheme.onSurfaceVariant,
             ),
