@@ -8,8 +8,6 @@ import 'theme/app_theme.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Jangan init yt-dlp di sini — native extract bisa crash proses.
-  // Init lazy saat user download.
   try {
     await DownloadManager.instance.initialize();
   } catch (_) {}

@@ -209,9 +209,22 @@ class YoutubeService {
 
   YoutubeExplode get client => _yt;
 
-  /// Manifest: default = androidSdkless (paling kompatibel per docs library).
+  /// Manifest: androidVr dulu (yt-dlp style, tanpa PO token), lalu fallback.
   Future<StreamManifest> getManifest(String videoId) async {
     Object? lastError;
+
+    try {
+      return await _yt.videos.streamsClient.getManifest(
+        videoId,
+        ytClients: [
+          YoutubeApiClient.androidVr,
+          YoutubeApiClient.androidSdkless,
+          YoutubeApiClient.ios,
+        ],
+      );
+    } catch (e) {
+      lastError = e;
+    }
 
     try {
       final m = await _yt.videos.streamsClient.getManifest(videoId);
@@ -224,21 +237,7 @@ class YoutubeService {
       lastError = e;
     }
 
-    // Fallback berurutan — library skip client yang gagal lalu merge.
-    try {
-      return await _yt.videos.streamsClient.getManifest(
-        videoId,
-        ytClients: [
-          YoutubeApiClient.androidSdkless,
-          YoutubeApiClient.ios,
-          YoutubeApiClient.android,
-        ],
-      );
-    } catch (e) {
-      lastError = e;
-    }
-
-    throw lastError ?? Exception('Stream tidak tersedia untuk video ini.');
+    throw Exception('Stream tidak tersedia untuk video ini: $lastError');
   }
 
   /// Ambil ulang opsi download dengan URL fresh untuk [height].
