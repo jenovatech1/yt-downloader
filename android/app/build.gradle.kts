@@ -43,13 +43,10 @@ android {
 
     packaging {
         jniLibs {
+            // Wajib: youtubedl butuh .so diextract ke filesystem.
             useLegacyPackaging = true
-            keepDebugSymbols += setOf(
-                "**/libffmpeg.zip.so",
-                "**/libpython.zip.so",
-                "**/libaria2c.zip.so",
-                "**/libc++_shared.so",
-            )
+            // Jangan strip .zip.so (bukan ELF) — AGP strip bisa corrupt.
+            keepDebugSymbols += "**/*.so"
             excludes += setOf(
                 "**/armeabi-v7a/**",
                 "**/x86/**",
@@ -74,6 +71,10 @@ android {
 
     buildTypes {
         release {
+            // R8 minify sering crash yt-dlp initPython di release (ZipUtils).
+            // Matikan dulu biar unduhan stabil; ProGuard rules tetap ada kalau diaktifkan lagi.
+            isMinifyEnabled = false
+            isShrinkResources = false
             signingConfig = if (keystorePropertiesFile.exists()) {
                 signingConfigs.getByName("release")
             } else {

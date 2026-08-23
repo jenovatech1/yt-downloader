@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 
 import 'screens/home_screen.dart';
 import 'services/download_manager.dart';
+import 'services/yt_dlp_service.dart';
 import 'theme/app_theme.dart';
 
 Future<void> main() async {
@@ -10,6 +11,11 @@ Future<void> main() async {
 
   try {
     await DownloadManager.instance.initialize();
+  } catch (_) {}
+
+  // Warm-up yt-dlp native (Python/FFmpeg unzip) di main isolate sebelum unduh.
+  try {
+    await YtDlpService.instance.ensureReady();
   } catch (_) {}
 
   await SystemChrome.setPreferredOrientations([

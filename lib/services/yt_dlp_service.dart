@@ -4,61 +4,54 @@ import 'dart:io';
 import 'package:extractor/extractor.dart';
 import 'package:path/path.dart' as p;
 
-/// yt-dlp via youtubedl-android (sama engine Seal).
-///
-/// 23 Agu 2026: `android_sdkless` sering HTTP 403 (yt-dlp#15712).
-/// Pakai `default,-android_sdkless` + update yt-dlp nightly.
+/// yt-dlp via youtubedl-android (engine sama Seal).
 class YtDlpService {
   YtDlpService._();
   static final YtDlpService instance = YtDlpService._();
 
   final _dl = YoutubeDLFlutter.instance;
   bool _ready = false;
-  bool _updating = false;
+  Future<void>? _initFuture;
 
-  Future<void> ensureReady() async {
+  /// Panggil di startup app (main) supaya crash/init error kelihatan sebelum unduh.
+  Future<void> ensureReady() {
+    return _initFuture ??= _doInit();
+  }
+
+  Future<void> _doInit() async {
     if (_ready) return;
     final init = await _dl.initialize(
       enableFFmpeg: true,
       enableAria2c: false,
     );
     if (!init.success) {
+      _initFuture = null;
       throw Exception(init.errorMessage ?? 'Gagal init yt-dlp');
     }
     _ready = true;
-    // Update dulu sebelum unduh ? binary bundled sering outdated ? 403.
-    await _tryUpdate();
+    // Update di background ? jangan blok / jangan crashkan unduhan pertama.
+    unawaited(_tryUpdate());
   }
 
   Future<void> _tryUpdate() async {
-    if (_updating) return;
-    _updating = true;
     try {
       await _dl.updateYoutubeDL(channel: UpdateChannel.stable);
-    } catch (_) {
-    } finally {
-      _updating = false;
-    }
+    } catch (_) {}
   }
 
   static String formatForHeight(int height) {
     final h = height.clamp(144, 1080);
-    // Prefer mp4/h264+m4a; fallback any.
     return 'bestvideo[height<=$h][ext=mp4]+bestaudio[ext=m4a]/'
         'bestvideo[height<=$h]+bestaudio/'
         'best[height<=$h]/best';
   }
 
-  /// Offisiial yt-dlp workaround Aug 2026 untuk 403.
+  /// Workaround 403 Aug 2026: exclude android_sdkless (yt-dlp#15712).
   Map<String?, String?> get _baseArgs => {
-        '--extractor-args':
-            'youtube:player_client=default,-android_sdkless',
+        '--extractor-args': 'youtube:player_client=default,-android_sdkless',
         '--merge-output-format': 'mp4',
-        '--no-mtime': '',
         '--retries': '15',
         '--fragment-retries': '15',
-        '--no-playlist': '',
-        '--no-warnings': '',
       };
 
   Future<String> downloadVideo({
@@ -81,7 +74,7 @@ class YtDlpService {
         sectionEnd > sectionStart) {
       custom['--download-sections'] =
           '*${sectionStart.toStringAsFixed(3)}-${sectionEnd.toStringAsFixed(3)}';
-      custom['--force-keyframes-at-cuts'] = '';
+      custom['--force-keyframes-at-cuts'] = 'true';
     }
 
     final sub = _dl.onProgress.listen((p) {
@@ -149,8 +142,6 @@ class YtDlpService {
           processId: processId,
           customOptions: {
             ..._baseArgs,
-            '--extract-audio': '',
-            '--audio-format': 'm4a',
           },
         ),
       );
