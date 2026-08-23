@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:extractor/extractor.dart';
 import 'package:path/path.dart' as p;
@@ -146,28 +147,61 @@ class YtDlpService {
     }
   }
 
+  /// Audio untuk Whisper: mono 16kHz 32kbps (sama desktop Klippod).
+  /// Cap ~85 menit biar tetap di bawah limit upload Groq ~23 MB.
+  static const groqMaxUploadBytes = 23 * 1024 * 1024;
+  static const transcribeMaxSeconds = 85 * 60;
+  static const slimAudioBytesPerSec = 4000; // 32 kbps
+
   Future<String> downloadAudio({
     required String videoId,
     required String outputDir,
     required YtProgressCallback onProgress,
+    Duration? videoDuration,
+    bool forTranscribe = true,
   }) async {
     await ensureReady();
     await Directory(outputDir).create(recursive: true);
 
     final processId = 'a_${videoId}_${DateTime.now().millisecondsSinceEpoch}';
     final url = 'https://www.youtube.com/watch?v=$videoId';
+    final durSec = videoDuration?.inSeconds ?? 0;
+    final capSec = forTranscribe
+        ? (durSec > 0
+            ? math.min(durSec, transcribeMaxSeconds)
+            : transcribeMaxSeconds)
+        : (durSec > 0 ? durSec : 0);
+    final estimated = forTranscribe
+        ? (capSec > 0 ? capSec * slimAudioBytesPerSec : 8 * 1024 * 1024)
+        : 0;
+
     final tracker = _ProgressTracker(
       processId: processId,
       phaseLabel: 'Mengunduh audio...',
       onProgress: onProgress,
+      estimatedTotalBytes: estimated,
+      watchDir: outputDir,
     );
     final subs = tracker.bind(_dl);
 
+    final custom = Map<String?, String?>.from(_baseArgs);
+    if (forTranscribe) {
+      // FFmpeg post: mono / 16kHz / 32k ? file kecil untuk Whisper.
+      custom['--postprocessor-args'] = 'ffmpeg:-ac 1 -ar 16000 -b:a 32k';
+      if (durSec > transcribeMaxSeconds) {
+        custom['--download-sections'] =
+            '*0-${transcribeMaxSeconds.toDouble()}';
+      }
+    }
+
     try {
       onProgress(
-        const YtDownloadProgress(
+        YtDownloadProgress(
           progress01: 0.02,
-          phase: 'Menyiapkan audio...',
+          phase: forTranscribe
+              ? 'Menyiapkan audio slim (32kbps)...'
+              : 'Menyiapkan audio...',
+          totalBytes: estimated,
         ),
       );
       final result = await _dl.download(
@@ -177,11 +211,11 @@ class YtDlpService {
           outputTemplate: '%(id)s_audio.%(ext)s',
           format: 'bestaudio/best',
           extractAudio: true,
-          audioFormat: 'm4a',
-          audioQuality: 5,
+          audioFormat: forTranscribe ? 'mp3' : 'm4a',
+          audioQuality: forTranscribe ? 9 : 5,
           noPlaylist: true,
           processId: processId,
-          customOptions: {..._baseArgs},
+          customOptions: custom,
         ),
       );
       if (result.status != OperationStatus.success) {
@@ -194,6 +228,12 @@ class YtDlpService {
         audioOnly: true,
       );
       final size = await File(out).length();
+      if (forTranscribe && size > groqMaxUploadBytes) {
+        throw Exception(
+          'Audio hasil ${(size / (1024 * 1024)).toStringAsFixed(1)} MB '
+          'masih di atas limit Groq ~23 MB. Coba video lebih pendek.',
+        );
+      }
       onProgress(
         YtDownloadProgress(
           progress01: 1,
@@ -260,21 +300,26 @@ class _ProgressTracker {
     required this.phaseLabel,
     required this.onProgress,
     this.estimatedTotalBytes = 0,
+    this.watchDir,
   });
 
   final String processId;
   final String phaseLabel;
   final YtProgressCallback onProgress;
   final int estimatedTotalBytes;
+  final String? watchDir;
 
   double _pct = 0;
   int _downloaded = 0;
   int _total = 0;
   double _speed = 0;
+  String _phase = '';
   DateTime? _lastTick;
   int _lastDownloaded = 0;
+  Timer? _poll;
 
   // [download]  45.2% of ~ 120.00MiB at  2.34MiB/s ETA 00:30
+  // [download] 100% of 5.20MiB in 00:03
   static final _lineRe = RegExp(
     r'\[download\]\s+([\d.]+)%\s+of\s+~?\s*([\d.]+)\s*(KiB|MiB|GiB|KB|MB|GB|B)'
     r'(?:\s+at\s+(?:([\d.]+)\s*(KiB|MiB|GiB|KB|MB|GB|B)/s|Unknown))?',
@@ -282,13 +327,24 @@ class _ProgressTracker {
   );
 
   _Subs bind(YoutubeDLFlutter dl) {
+    _phase = phaseLabel;
+    if (_total <= 0 && estimatedTotalBytes > 0) {
+      _total = estimatedTotalBytes;
+    }
+    if (watchDir != null) {
+      _poll = Timer.periodic(const Duration(milliseconds: 500), (_) {
+        unawaited(_pollDir());
+      });
+    }
     final a = dl.onProgress.listen((p) {
       if (p.processId != processId) return;
-      _pct = (p.progress / 100).clamp(0.0, 0.99);
+      final next = (p.progress / 100).clamp(0.0, 0.99);
+      // Jangan turunkan progress (postprocess sering kirim 0 lagi).
+      if (next >= _pct) _pct = next;
       if (_total <= 0 && estimatedTotalBytes > 0) {
         _total = estimatedTotalBytes;
       }
-      if (_total > 0) {
+      if (_total > 0 && _downloaded < (_pct * _total).round()) {
         _downloaded = (_pct * _total).round();
       }
       if (p.etaInSeconds > 0 && _total > _downloaded) {
@@ -300,22 +356,78 @@ class _ProgressTracker {
       if (log.processId != processId) return;
       _parseLog(log.message);
     });
-    return _Subs([a, b]);
+    return _Subs([a, b], onCancel: () {
+      _poll?.cancel();
+      _poll = null;
+    });
+  }
+
+  Future<void> _pollDir() async {
+    final dir = watchDir;
+    if (dir == null) return;
+    try {
+      final folder = Directory(dir);
+      if (!await folder.exists()) return;
+      var biggest = 0;
+      await for (final e in folder.list(recursive: true)) {
+        if (e is! File) continue;
+        final len = await e.length();
+        if (len > biggest) biggest = len;
+      }
+      if (biggest <= _downloaded) return;
+      final now = DateTime.now();
+      if (_lastTick != null) {
+        final dt = now.difference(_lastTick!).inMilliseconds / 1000.0;
+        if (dt > 0.2) {
+          _speed = (biggest - _downloaded) / dt;
+        }
+      }
+      _downloaded = biggest;
+      _lastTick = now;
+      _lastDownloaded = biggest;
+      if (_total > 0) {
+        _pct = (_downloaded / _total).clamp(0.0, 0.95);
+      } else if (_pct < 0.05) {
+        _pct = 0.05;
+      }
+      if (_phase.contains('Menyiapkan') || _phase.contains('Mengunduh')) {
+        _phase = phaseLabel;
+      }
+      _emit();
+    } catch (_) {}
   }
 
   void _parseLog(String message) {
+    final lower = message.toLowerCase();
+    if (lower.contains('extractaudio') ||
+        (lower.contains('destination') && lower.contains('mp3')) ||
+        lower.contains('post-process') ||
+        lower.contains('merging')) {
+      _phase = 'Mengompres audio...';
+      if (_pct < 0.85) _pct = 0.85;
+      _emit();
+    }
+
     final m = _lineRe.firstMatch(message);
     if (m == null) return;
     final pct = double.tryParse(m.group(1) ?? '') ?? _pct * 100;
-    _pct = (pct / 100).clamp(0.0, 0.99);
+    final next = (pct / 100).clamp(0.0, 0.99);
+    if (next >= _pct) _pct = next;
     final total = _toBytes(m.group(2), m.group(3));
-    if (total != null && total > 0) _total = total;
+    // Untuk mode slim, total dari log bisa jauh lebih besar (source
+    // sebelum compress). Pakai estimasi slim kalau sudah ada.
+    if (total != null && total > 0) {
+      if (estimatedTotalBytes <= 0 || total <= estimatedTotalBytes * 1.5) {
+        _total = total;
+      }
+    }
     final speed = _toBytes(m.group(4), m.group(5));
     if (speed != null && speed > 0) {
       _speed = speed.toDouble();
     }
     if (_total > 0) {
-      _downloaded = (_pct * _total).round();
+      final fromPct = (_pct * _total).round();
+      if (fromPct > _downloaded) _downloaded = fromPct;
     }
     final now = DateTime.now();
     if (_lastTick != null && _downloaded > _lastDownloaded) {
@@ -326,6 +438,7 @@ class _ProgressTracker {
     }
     _lastTick = now;
     _lastDownloaded = _downloaded;
+    _phase = phaseLabel;
     _emit();
   }
 
@@ -333,7 +446,7 @@ class _ProgressTracker {
     onProgress(
       YtDownloadProgress(
         progress01: _pct <= 0 ? 0.01 : _pct,
-        phase: phaseLabel,
+        phase: _phase.isEmpty ? phaseLabel : _phase,
         downloadedBytes: _downloaded,
         totalBytes: _total > 0 ? _total : estimatedTotalBytes,
         speedBytesPerSecond: _speed,
@@ -364,9 +477,11 @@ class _ProgressTracker {
 }
 
 class _Subs {
-  _Subs(this._subs);
+  _Subs(this._subs, {this.onCancel});
   final List<StreamSubscription<dynamic>> _subs;
+  final void Function()? onCancel;
   Future<void> cancel() async {
+    onCancel?.call();
     for (final s in _subs) {
       await s.cancel();
     }

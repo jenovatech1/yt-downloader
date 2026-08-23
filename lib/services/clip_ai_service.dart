@@ -4,6 +4,8 @@ import 'dart:math' as math;
 
 import 'package:http/http.dart' as http;
 
+import 'yt_dlp_service.dart';
+
 class HookCandidate {
   const HookCandidate({
     required this.startSec,
@@ -43,26 +45,76 @@ class ClipAiService {
     required String groqKey,
     required String geminiKey,
   }) async {
+    final size = await audioFile.length();
+    final mb = size / (1024 * 1024);
     final errors = <String>[];
+
+    // Groq Whisper hard limit ~25 MB. Jangan fallback ke Gemini "too large"
+    // yang membingungkan kalau file sudah di luar kapasitas Whisper.
     if (groqKey.isNotEmpty) {
+      if (size > YtDlpService.groqMaxUploadBytes) {
+        throw Exception(
+          'Audio ${mb.toStringAsFixed(1)} MB melebihi limit Groq Whisper (~23 MB). '
+          'Video terlalu panjang — coba yang lebih pendek.',
+        );
+      }
       try {
         return await _groqTranscribe(audioFile, groqKey);
       } catch (e) {
-        errors.add('Groq: $e');
+        errors.add('Groq: ${_friendlyHttp(e)}');
+        // Size / entity-too-large: jangan lanjut Gemini (pesan "terlalu besar" palsu).
+        if (_isSizeError(e)) {
+          throw Exception(errors.join('\n'));
+        }
       }
     }
+
     if (geminiKey.isNotEmpty) {
-      try {
-        return await _geminiTranscribe(audioFile, geminiKey);
-      } catch (e) {
-        errors.add('Gemini: $e');
+      if (size > 18 * 1024 * 1024) {
+        errors.add(
+          'Gemini dilewati: audio ${mb.toStringAsFixed(1)} MB '
+          '(batas inline Gemini ~18 MB).',
+        );
+      } else {
+        try {
+          return await _geminiTranscribe(audioFile, geminiKey);
+        } catch (e) {
+          errors.add('Gemini: ${_friendlyHttp(e)}');
+        }
       }
     }
+
     throw Exception(
       errors.isEmpty
-          ? 'Isi API key Groq atau Gemini di Pengaturan dulu.'
+          ? 'Isi API key Groq di Pengaturan dulu.'
           : 'Transkrip gagal:\n${errors.join('\n')}',
     );
+  }
+
+  static bool _isSizeError(Object e) {
+    final s = '$e'.toLowerCase();
+    return s.contains('too large') ||
+        s.contains('entity too large') ||
+        s.contains('413') ||
+        s.contains('payload') ||
+        s.contains('request_too_large') ||
+        s.contains('maximum content size') ||
+        s.contains('file size');
+  }
+
+  static String _friendlyHttp(Object e) {
+    final s = e.toString();
+    if (_isSizeError(e)) {
+      return 'file terlalu besar untuk Whisper (~23 MB).';
+    }
+    if (s.contains('SocketException') || s.contains('ClientException')) {
+      return 'jaringan gagal / timeout. Coba lagi.';
+    }
+    if (s.contains('TimeoutException')) {
+      return 'timeout. Coba lagi atau video lebih pendek.';
+    }
+    if (s.length > 220) return '${s.substring(0, 220)}…';
+    return s;
   }
 
   Future<List<HookCandidate>> suggestHooks({
@@ -149,9 +201,6 @@ class ClipAiService {
 
   Future<String> _geminiTranscribe(File file, String apiKey) async {
     final bytes = await file.readAsBytes();
-    if (bytes.length > 18 * 1024 * 1024) {
-      throw Exception('Audio terlalu besar untuk Gemini. Tambahkan key Groq.');
-    }
     final json = await _geminiGenerate(
       apiKey: apiKey,
       parts: [

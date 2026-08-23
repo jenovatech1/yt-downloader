@@ -278,10 +278,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } catch (e) {
       if (!mounted) return;
       setState(() => _clipping = false);
+      ScaffoldMessenger.of(context).clearSnackBars();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('Get Clip gagal: ${YoutubeService.shortError(e)}'),
           backgroundColor: Theme.of(context).colorScheme.error,
+          duration: const Duration(days: 1),
+          showCloseIcon: true,
         ),
       );
     }

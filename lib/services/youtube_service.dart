@@ -508,13 +508,13 @@ class YoutubeService {
   }
 
   static String shortError(Object e) {
-    final s = e.toString();
+    var s = e.toString().replaceFirst(RegExp(r'^Exception:\s*'), '');
     if (s.contains('fatal failure') ||
         s.contains('FatalFailure') ||
         s.contains('YouTube most likely changed')) {
       return 'YouTube memblokir request. Coba lagi / update app.';
     }
-    if (s.length > 180) return '${s.substring(0, 180)}…';
+    if (s.length > 280) return '${s.substring(0, 280)}…';
     return s;
   }
 }

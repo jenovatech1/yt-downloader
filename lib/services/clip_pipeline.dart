@@ -63,20 +63,27 @@ class ClipPipeline {
     if (await workDir.exists()) await workDir.delete(recursive: true);
     await workDir.create(recursive: true);
 
-    emit('Mengunduh audio (yt-dlp)...', 0.08);
+    emit('Mengunduh audio slim...', 0.05);
     final audioPath = await YtDlpService.instance.downloadAudio(
       videoId: video.id.value,
       outputDir: p.join(workDir.path, 'audio'),
+      videoDuration: video.duration,
+      forTranscribe: true,
       onProgress: (p) => emit(
         p.phase,
-        0.08 + 0.24 * p.progress01,
+        0.05 + 0.30 * p.progress01,
         downloaded: p.downloadedBytes,
         total: p.totalBytes,
         speed: p.speedBytesPerSecond,
       ),
     );
 
-    emit('Transkrip audio (AI)...', 0.35);
+    emit(
+      'Transkrip audio (Whisper)...',
+      0.38,
+      downloaded: await File(audioPath).length(),
+      total: await File(audioPath).length(),
+    );
     final transcript = await _ai.transcribe(
       audioFile: File(audioPath),
       groqKey: groq,
