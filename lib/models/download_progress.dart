@@ -7,6 +7,7 @@ class DownloadProgress {
     required this.speedBytesPerSecond,
     this.isDone = false,
     this.error,
+    this.detail,
   });
 
   final String phase;
@@ -16,8 +17,18 @@ class DownloadProgress {
   final double speedBytesPerSecond;
   final bool isDone;
   final String? error;
+  /// Baris keterangan ekstra (mis. progress klip saat ini).
+  final String? detail;
 
-  int get remainingBytes => (totalBytes - downloadedBytes).clamp(0, totalBytes);
+  int get remainingBytes {
+    if (totalBytes <= 0) return 0;
+    final rem = totalBytes - downloadedBytes;
+    return rem > 0 ? rem : 0;
+  }
+
+  /// Total tampilan: jangan lebih kecil dari terunduh.
+  int get displayTotalBytes =>
+      downloadedBytes > totalBytes ? downloadedBytes : totalBytes;
 
   factory DownloadProgress.fromMap(Map<String, dynamic> map) {
     return DownloadProgress(
@@ -29,6 +40,7 @@ class DownloadProgress {
           (map['speedBytesPerSecond'] as num?)?.toDouble() ?? 0,
       isDone: map['isDone'] as bool? ?? false,
       error: map['error'] as String?,
+      detail: map['detail'] as String?,
     );
   }
 
@@ -40,6 +52,7 @@ class DownloadProgress {
         'speedBytesPerSecond': speedBytesPerSecond,
         'isDone': isDone,
         'error': error,
+        'detail': detail,
       };
 
   static const idle = DownloadProgress(

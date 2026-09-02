@@ -16,6 +16,8 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   final _groq = TextEditingController();
   final _gemini = TextEditingController();
+  final _openrouter = TextEditingController();
+  ClipHookProvider _hookProvider = ClipHookProvider.auto;
   bool _loading = true;
   bool _saving = false;
 
@@ -28,10 +30,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _load() async {
     final groq = await ApiKeysService.instance.groqKey();
     final gemini = await ApiKeysService.instance.geminiKey();
+    final openrouter = await ApiKeysService.instance.openrouterKey();
+    final prefer = await ApiKeysService.instance.hookProvider();
     if (!mounted) return;
     setState(() {
       _groq.text = groq;
       _gemini.text = gemini;
+      _openrouter.text = openrouter;
+      _hookProvider = prefer;
       _loading = false;
     });
   }
@@ -40,6 +46,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() => _saving = true);
     await ApiKeysService.instance.saveGroqKey(_groq.text);
     await ApiKeysService.instance.saveGeminiKey(_gemini.text);
+    await ApiKeysService.instance.saveOpenrouterKey(_openrouter.text);
+    await ApiKeysService.instance.saveHookProvider(_hookProvider);
     if (!mounted) return;
     setState(() => _saving = false);
     ScaffoldMessenger.of(context).showSnackBar(
@@ -51,6 +59,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void dispose() {
     _groq.dispose();
     _gemini.dispose();
+    _openrouter.dispose();
     super.dispose();
   }
 
@@ -71,12 +80,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'Sama seperti Klippod. Groq (Whisper + GPT-OSS) untuk transkrip & hook; '
-                  'Gemini cadangan. Model lama llama-3.3 sudah shutdown. '
-                  'Kalau salah satu gagal, yang lain dipakai sebagai cadangan.',
+                  'Sama seperti Klippod. Groq/Gemini untuk Whisper; '
+                  'pilih provider hook di bawah (bisa OpenRouter dulu). '
+                  'OpenRouter tidak punya Whisper.',
                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                     color: Theme.of(context).colorScheme.onSurfaceVariant,
                   ),
+                ),
+                const SizedBox(height: 16),
+                DropdownButtonFormField<ClipHookProvider>(
+                  initialValue: _hookProvider,
+                  decoration: const InputDecoration(
+                    labelText: 'Cari hook pakai',
+                    border: OutlineInputBorder(),
+                  ),
+                  items: [
+                    for (final p in ClipHookProvider.values)
+                      DropdownMenuItem(value: p, child: Text(p.label)),
+                  ],
+                  onChanged: (v) {
+                    if (v == null) return;
+                    setState(() => _hookProvider = v);
+                  },
                 ),
                 const SizedBox(height: 20),
                 TextField(
@@ -116,6 +141,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       mode: LaunchMode.externalApplication,
                     ),
                     child: const Text('Ambil key Gemini'),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: _openrouter,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    labelText: 'OpenRouter API key',
+                    hintText: 'sk-or-...',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton(
+                    onPressed: () => launchUrl(
+                      Uri.parse('https://openrouter.ai/keys'),
+                      mode: LaunchMode.externalApplication,
+                    ),
+                    child: const Text('Ambil key OpenRouter'),
                   ),
                 ),
                 const SizedBox(height: 24),

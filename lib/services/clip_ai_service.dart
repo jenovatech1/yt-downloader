@@ -4,6 +4,11 @@ import 'dart:math' as math;
 
 import 'package:http/http.dart' as http;
 
+import '../config/get_clip_config.dart';
+import '../models/clip_transcript.dart';
+import 'api_keys_service.dart';
+import 'clip_plan_shards.dart';
+import 'openrouter_service.dart';
 import 'yt_dlp_service.dart';
 
 class HookCandidate {
@@ -20,27 +25,27 @@ class HookCandidate {
   final double? score;
 }
 
-/// Hook AI — model & prompt diselaraskan dengan desktop Klippod (Agu 2026).
+/// Whisper + hook — diselaraskan dengan desktop Klippod.
 class ClipAiService {
   ClipAiService({http.Client? client}) : _client = client ?? http.Client();
 
   final http.Client _client;
 
-  static const _groqWhisper = 'whisper-large-v3-turbo';
-  /// llama-3.3-70b-versatile shutdown 16 Agu 2026 → gpt-oss-120b.
+  static const _whisperModels = ['whisper-large-v3-turbo', 'whisper-large-v3'];
+
+  /// Desktop: gpt-oss-120b / gpt-oss-20b / qwen — TPM terpisah, di-shard parallel.
   static const _clipModels = [
     'openai/gpt-oss-120b',
-    'qwen/qwen3.6-27b',
     'openai/gpt-oss-20b',
+    'qwen/qwen3.6-27b',
   ];
-  static const _clipPlanMaxChars = 22000;
   static const _geminiModels = [
     'gemini-2.0-flash',
     'gemini-2.5-flash',
     'gemini-1.5-flash',
   ];
 
-  Future<String> transcribe({
+  Future<ClipTranscript> transcribe({
     required File audioFile,
     required String groqKey,
     required String geminiKey,
@@ -49,8 +54,6 @@ class ClipAiService {
     final mb = size / (1024 * 1024);
     final errors = <String>[];
 
-    // Groq Whisper hard limit ~25 MB. Jangan fallback ke Gemini "too large"
-    // yang membingungkan kalau file sudah di luar kapasitas Whisper.
     if (groqKey.isNotEmpty) {
       if (size > YtDlpService.groqMaxUploadBytes) {
         throw Exception(
@@ -62,7 +65,6 @@ class ClipAiService {
         return await _groqTranscribe(audioFile, groqKey);
       } catch (e) {
         errors.add('Groq: ${_friendlyHttp(e)}');
-        // Size / entity-too-large: jangan lanjut Gemini (pesan "terlalu besar" palsu).
         if (_isSizeError(e)) {
           throw Exception(errors.join('\n'));
         }
@@ -122,12 +124,14 @@ class ClipAiService {
     required Duration videoDuration,
     required String groqKey,
     required String geminiKey,
+    String openrouterKey = '',
+    ClipHookProvider prefer = ClipHookProvider.auto,
     String? youtubeUrl,
   }) async {
     final errors = <String>[];
 
-    // Desktop: Groq dulu, lalu Gemini.
-    if (groqKey.isNotEmpty) {
+    Future<List<HookCandidate>?> tryGroq() async {
+      if (groqKey.isEmpty) return null;
       try {
         final hooks = await _groqHooks(
           transcript: transcript,
@@ -138,8 +142,11 @@ class ClipAiService {
       } catch (e) {
         errors.add('Groq: $e');
       }
+      return null;
     }
-    if (geminiKey.isNotEmpty) {
+
+    Future<List<HookCandidate>?> tryGemini() async {
+      if (geminiKey.isEmpty) return null;
       try {
         final hooks = await _geminiHooks(
           transcript: transcript,
@@ -151,7 +158,37 @@ class ClipAiService {
       } catch (e) {
         errors.add('Gemini: $e');
       }
+      return null;
     }
+
+    Future<List<HookCandidate>?> tryOpenRouter() async {
+      if (openrouterKey.isEmpty) return null;
+      try {
+        final hooks = await OpenRouterService(client: _client).suggestHooks(
+          transcript: transcript,
+          videoDuration: videoDuration,
+          apiKey: openrouterKey,
+        );
+        if (hooks.isNotEmpty) return hooks;
+      } catch (e) {
+        errors.add('OpenRouter: $e');
+      }
+      return null;
+    }
+
+    final order = switch (prefer) {
+      ClipHookProvider.openrouter => [tryOpenRouter, tryGroq, tryGemini],
+      ClipHookProvider.gemini => [tryGemini, tryGroq, tryOpenRouter],
+      ClipHookProvider.groq => [tryGroq, tryGemini, tryOpenRouter],
+      ClipHookProvider.auto => [tryGroq, tryGemini, tryOpenRouter],
+      ClipHookProvider.ownAi => <Future<List<HookCandidate>?> Function()>[],
+    };
+
+    for (final run in order) {
+      final hooks = await run();
+      if (hooks != null && hooks.isNotEmpty) return hooks;
+    }
+
     throw Exception(
       errors.isEmpty
           ? 'Tidak ada hook yang ditemukan.'
@@ -159,47 +196,111 @@ class ClipAiService {
     );
   }
 
-  Future<String> _groqTranscribe(File file, String apiKey) async {
+  Future<ClipTranscript> _groqTranscribe(File file, String apiKey) async {
     final bytes = await file.readAsBytes();
-    final built = _multipart(
-      model: _groqWhisper,
-      fileName: file.uri.pathSegments.last,
-      fileBytes: bytes,
-    );
-    final response = await _client
-        .post(
-          Uri.parse('https://api.groq.com/openai/v1/audio/transcriptions'),
-          headers: {
-            'Authorization': 'Bearer $apiKey',
-            'Content-Type': 'multipart/form-data; boundary=${built.boundary}',
-          },
-          body: built.bytes,
-        )
-        .timeout(const Duration(seconds: 180));
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception('${response.statusCode} ${response.body}');
+    Object? last;
+    for (final model in _whisperModels) {
+      try {
+        final built = _multipart(
+          model: model,
+          fileName: file.uri.pathSegments.last,
+          fileBytes: bytes,
+        );
+        final response = await _client
+            .post(
+              Uri.parse('https://api.groq.com/openai/v1/audio/transcriptions'),
+              headers: {
+                'Authorization': 'Bearer $apiKey',
+                'Content-Type':
+                    'multipart/form-data; boundary=${built.boundary}',
+              },
+              body: built.bytes,
+            )
+            .timeout(const Duration(seconds: 180));
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          return _parseWhisperResponse(response.body);
+        }
+        last = Exception('${response.statusCode} ${response.body}');
+        final body = response.body.toLowerCase();
+        final canFallback =
+            response.statusCode == 400 ||
+            response.statusCode == 404 ||
+            body.contains('model') ||
+            body.contains('decommission') ||
+            body.contains('not found') ||
+            body.contains('unsupported');
+        if (!canFallback) throw last;
+      } catch (e) {
+        last = e;
+        final s = '$e'.toLowerCase();
+        final canFallback =
+            s.contains('400') ||
+            s.contains('404') ||
+            s.contains('model') ||
+            s.contains('not found');
+        if (!canFallback) rethrow;
+      }
     }
-    final json = jsonDecode(response.body) as Map<String, dynamic>;
+    throw last ?? Exception('Whisper gagal');
+  }
+
+  ClipTranscript _parseWhisperResponse(String body) {
+    final json = jsonDecode(body) as Map<String, dynamic>;
+    final cues = <ClipTranscriptCue>[];
+    final globalWords = _parseWhisperWords(json['words']);
     final segments = json['segments'] as List?;
-    if (segments != null && segments.isNotEmpty) {
-      final buf = StringBuffer();
+    if (segments != null) {
       for (final seg in segments) {
         if (seg is! Map) continue;
         final start = (seg['start'] as num?)?.toDouble() ?? 0;
         final end = (seg['end'] as num?)?.toDouble() ?? start;
         final text = (seg['text'] ?? '').toString().trim();
         if (text.isEmpty) continue;
-        buf.writeln('[${_fmtTs(start)}-${_fmtTs(end)}] $text');
+        final segmentWords = _parseWhisperWords(seg['words']);
+        final words = segmentWords.isNotEmpty
+            ? segmentWords
+            : globalWords
+                  .where((w) => w.endSec > start && w.startSec < end)
+                  .toList();
+        cues.add(
+          ClipTranscriptCue(
+            startSec: start,
+            endSec: end,
+            text: text,
+            wordTimings: words,
+          ),
+        );
       }
-      final stamped = buf.toString().trim();
-      if (stamped.isNotEmpty) return stamped;
+    }
+    if (cues.isNotEmpty) {
+      final buf = StringBuffer();
+      for (final c in cues) {
+        buf.writeln('[${_fmtTs(c.startSec)}-${_fmtTs(c.endSec)}] ${c.text}');
+      }
+      return ClipTranscript(stampedText: buf.toString().trim(), cues: cues);
     }
     final text = (json['text'] ?? '').toString().trim();
     if (text.isEmpty) throw Exception('Transkrip Groq kosong');
-    return text;
+    return ClipTranscript(stampedText: text, cues: const []);
   }
 
-  Future<String> _geminiTranscribe(File file, String apiKey) async {
+  List<ClipTranscriptWord> _parseWhisperWords(Object? raw) {
+    if (raw is! List) return const [];
+    final words = <ClipTranscriptWord>[];
+    for (final item in raw) {
+      if (item is! Map) continue;
+      final word = (item['word'] ?? item['text'] ?? '').toString().trim();
+      final start = (item['start'] as num?)?.toDouble();
+      final end = (item['end'] as num?)?.toDouble();
+      if (word.isEmpty || start == null || end == null || end <= start) {
+        continue;
+      }
+      words.add(ClipTranscriptWord(word: word, startSec: start, endSec: end));
+    }
+    return words;
+  }
+
+  Future<ClipTranscript> _geminiTranscribe(File file, String apiKey) async {
     final bytes = await file.readAsBytes();
     final json = await _geminiGenerate(
       apiKey: apiKey,
@@ -212,7 +313,9 @@ class ClipAiService {
         },
         {
           'inline_data': {
-            'mime_type': 'audio/mp4',
+            'mime_type': file.path.toLowerCase().endsWith('.mp3')
+                ? 'audio/mpeg'
+                : 'audio/mp4',
             'data': base64Encode(bytes),
           },
         },
@@ -222,104 +325,199 @@ class ClipAiService {
     try {
       final decoded = jsonDecode(text);
       if (decoded is Map && decoded['segments'] is List) {
-        final buf = StringBuffer();
+        final cues = <ClipTranscriptCue>[];
         for (final seg in decoded['segments'] as List) {
           if (seg is! Map) continue;
           final start = _seconds(seg['start']) ?? 0;
           final end = _seconds(seg['end']) ?? start;
           final t = (seg['text'] ?? '').toString().trim();
           if (t.isEmpty) continue;
-          buf.writeln('[${_fmtTs(start)}-${_fmtTs(end)}] $t');
+          cues.add(ClipTranscriptCue(startSec: start, endSec: end, text: t));
         }
-        final stamped = buf.toString().trim();
-        if (stamped.isNotEmpty) return stamped;
+        if (cues.isNotEmpty) {
+          final buf = StringBuffer();
+          for (final c in cues) {
+            buf.writeln(
+              '[${_fmtTs(c.startSec)}-${_fmtTs(c.endSec)}] ${c.text}',
+            );
+          }
+          return ClipTranscript(stampedText: buf.toString().trim(), cues: cues);
+        }
       }
       if (decoded is Map && decoded['text'] != null) {
-        return decoded['text'].toString();
+        final t = decoded['text'].toString();
+        return ClipTranscript(stampedText: t, cues: const []);
       }
     } catch (_) {}
     if (text.trim().isEmpty) throw Exception('Transkrip Gemini kosong');
-    return text.trim();
+    return ClipTranscript(stampedText: text.trim(), cues: const []);
   }
 
+  /// Mirror desktop `generateClipPlan`: pecah transkrip → shard ke 3 model (TPM parallel).
   Future<List<HookCandidate>> _groqHooks({
     required String transcript,
     required Duration videoDuration,
     required String apiKey,
   }) async {
-    final excerpt = _trimTranscript(transcript);
     final durSec = videoDuration.inSeconds;
+    final shards = buildClipPlanShards(
+      transcript,
+      modelChain: _clipModels,
+      minClips: 3,
+      maxClips: GetClipConfig.maxClips,
+    );
+    if (shards.isEmpty) {
+      throw Exception('Transkrip kosong untuk clip plan');
+    }
+
+    final byModel = <String, List<ClipPlanShard>>{};
+    for (final s in shards) {
+      byModel.putIfAbsent(s.model, () => []).add(s);
+    }
+
+    final parts = await Future.wait([
+      for (final entry in byModel.entries)
+        _runClipShardQueue(
+          model: entry.key,
+          shards: entry.value,
+          apiKey: apiKey,
+          videoDuration: videoDuration,
+          durSec: durSec,
+        ),
+    ]);
+
+    final merged = <HookCandidate>[];
+    final seen = <String>{};
+    for (final list in parts) {
+      for (final h in list) {
+        final key =
+            '${h.startSec.toStringAsFixed(1)}-${h.endSec.toStringAsFixed(1)}';
+        if (seen.add(key)) merged.add(h);
+      }
+    }
+    merged.sort((a, b) => (b.score ?? 0).compareTo(a.score ?? 0));
+    if (merged.isEmpty) {
+      throw Exception(
+        'Generate clips gagal di semua shard (TPM/format). '
+        'Coba lagi sebentar atau isi Gemini di Pengaturan.',
+      );
+    }
+    return merged.take(GetClipConfig.maxClips).toList();
+  }
+
+  Future<List<HookCandidate>> _runClipShardQueue({
+    required String model,
+    required List<ClipPlanShard> shards,
+    required String apiKey,
+    required Duration videoDuration,
+    required int durSec,
+  }) async {
+    final out = <HookCandidate>[];
+    for (final shard in shards) {
+      final excerpt = shard.text.length > ClipPlanBudget.maxTranscriptChars
+          ? ClipPlanBudget.trimTranscript(shard.text)
+          : shard.text;
+      try {
+        final hooks = await _requestClipPlanOnce(
+          model: model,
+          excerpt: excerpt,
+          minClips: shard.minClips,
+          maxClips: shard.maxClips,
+          apiKey: apiKey,
+          videoDuration: videoDuration,
+          durSec: durSec,
+        );
+        out.addAll(hooks);
+      } catch (e) {
+        final s = '$e'.toLowerCase();
+        final isTpm = s.contains('429') || s.contains('rate limit');
+        if (!isTpm) continue;
+        // Desktop: tunggu TPM reset model ini, retry sekali — jangan lompat model.
+        await Future<void>.delayed(const Duration(seconds: 28));
+        final smaller = ClipPlanBudget.trimTranscript(
+          excerpt,
+          maxChars: math.max(800, excerpt.length ~/ 2),
+        );
+        try {
+          final hooks = await _requestClipPlanOnce(
+            model: model,
+            excerpt: smaller,
+            minClips: shard.minClips,
+            maxClips: math.min(shard.maxClips, 6),
+            apiKey: apiKey,
+            videoDuration: videoDuration,
+            durSec: durSec,
+          );
+          out.addAll(hooks);
+        } catch (_) {
+          continue;
+        }
+      }
+    }
+    return out;
+  }
+
+  Future<List<HookCandidate>> _requestClipPlanOnce({
+    required String model,
+    required String excerpt,
+    required int minClips,
+    required int maxClips,
+    required String apiKey,
+    required Duration videoDuration,
+    required int durSec,
+  }) async {
+    final countLine =
+        'Hasilkan $minClips-$maxClips kandidat klip (usahakan mendekati $maxClips '
+        'jika ada cukup momen kuat). Jangan hanya 1-3 klip.';
     final system =
-        'Durasi tiap klip 30-90 detik (boleh sampai 180 jika konteks butuh). '
         'Buat rencana klip Reels/TikTok dari podcast/interview. '
-        'Bahasa hook_text = bahasa transkrip. '
-        'Transkrip berisi timestamp seperti [HH:MM:SS.mmm-HH:MM:SS.mmm]. '
-        'Durasi video sekitar ${(durSec / 60).round()} menit. '
-        'Target 5-10 klip. '
-        'WAJIB pilih start_time/end_time dari timestamp yang ada (copy persis), '
-        'end di akhir kalimat. '
-        'hook_text 4-10 kata, clickbait/curiosity, tapi harus sesuai isi window. '
+        'Durasi tiap klip ${GetClipConfig.durationPrompt}. '
+        'Video ~${(durSec / 60).round()} menit. $countLine '
+        'Copy start_time/end_time dari timestamp transkrip (persis). '
+        'hook_text 4-10 kata, bahasa = bahasa transkrip. '
+        'Sebar awal/tengah/akhir. Hindari overlap & filler. '
         'Balas HANYA JSON object {"clips":[...]}.';
     final user =
         'Gunakan transkrip berikut dan BALAS HANYA JSON: '
         '{"clips":[{"start_time":"00:00:05.000","end_time":"00:01:10.000",'
         '"hook_text":"Topik singkat","score":92,"keywords":["trik"]}]}. '
-        'Transkrip: $excerpt';
+        '$countLine Transkrip: $excerpt';
 
-    Object? last;
-    for (final model in _clipModels) {
-      try {
-        final response = await _client
-            .post(
-              Uri.parse('https://api.groq.com/openai/v1/chat/completions'),
-              headers: {
-                'Authorization': 'Bearer $apiKey',
-                'Content-Type': 'application/json',
-              },
-              body: jsonEncode({
-                'model': model,
-                'temperature': 0.35,
-                'max_tokens': 4096,
-                'response_format': {'type': 'json_object'},
-                'messages': [
-                  {'role': 'system', 'content': system},
-                  {'role': 'user', 'content': 'Tidak ada hook awal.'},
-                  {'role': 'user', 'content': user},
-                ],
-              }),
-            )
-            .timeout(const Duration(seconds: 120));
-        if (response.statusCode >= 200 && response.statusCode < 300) {
-          final json = jsonDecode(response.body) as Map<String, dynamic>;
-          final content = (json['choices'] as List?)
-                  ?.first?['message']?['content'] as String? ??
-              '';
-          final hooks = parseHooks(content, videoDuration);
-          if (hooks.isNotEmpty) return hooks;
-          last = Exception('Model $model: response kosong / tidak parse');
-          continue;
-        }
-        last = Exception('${response.statusCode} ${response.body}');
-        final body = response.body.toLowerCase();
-        final canFallback = response.statusCode == 400 ||
-            response.statusCode == 404 ||
-            body.contains('model') ||
-            body.contains('decommission') ||
-            body.contains('not found') ||
-            body.contains('does not exist');
-        if (!canFallback) throw last;
-      } catch (e) {
-        last = e;
-        final msg = '$e'.toLowerCase();
-        final canFallback = msg.contains('400') ||
-            msg.contains('404') ||
-            msg.contains('model') ||
-            msg.contains('decommission') ||
-            msg.contains('not found');
-        if (!canFallback) rethrow;
-      }
+    final body = <String, dynamic>{
+      'model': model,
+      'temperature': 0.35,
+      'max_tokens': ClipPlanBudget.maxOutputTokens,
+      'response_format': {'type': 'json_object'},
+      'messages': [
+        {'role': 'system', 'content': system},
+        {'role': 'user', 'content': 'Tidak ada hook awal.'},
+        {'role': 'user', 'content': user},
+      ],
+    };
+    if (model.contains('gpt-oss')) {
+      body['reasoning_effort'] = 'low';
+    } else if (model.contains('qwen')) {
+      body['reasoning_effort'] = 'none';
     }
-    throw last ?? Exception('Semua model Groq clip gagal');
+
+    final response = await _client
+        .post(
+          Uri.parse('https://api.groq.com/openai/v1/chat/completions'),
+          headers: {
+            'Authorization': 'Bearer $apiKey',
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode(body),
+        )
+        .timeout(const Duration(seconds: 120));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('${response.statusCode} ${response.body}');
+    }
+    final json = jsonDecode(response.body) as Map<String, dynamic>;
+    final content =
+        (json['choices'] as List?)?.first?['message']?['content'] as String? ??
+        '';
+    return parseHooks(content, videoDuration);
   }
 
   Future<List<HookCandidate>> _geminiHooks({
@@ -329,27 +527,21 @@ class ClipAiService {
     String? youtubeUrl,
   }) async {
     final prompt =
-        '$_systemBrief(videoDuration)\n\n'
+        'Pilih hook viral dari video durasi ${videoDuration.inSeconds}s. '
+        'Target ${GetClipConfig.maxClips} klip maks, durasi ${GetClipConfig.durationPrompt}, '
+        'sebar di awal/tengah/akhir.\n\n'
         'Balas HANYA JSON: {"clips":[{"start_time":"00:00:05.000",'
         '"end_time":"00:01:10.000","hook_text":"...","score":90}]}\n\n'
-        'Transkrip:\n${_trimTranscript(transcript)}';
+        'Transkrip:\n${ClipPlanBudget.trimTranscript(transcript)}';
     final parts = <Map<String, dynamic>>[
       {'text': prompt},
       if (youtubeUrl != null && youtubeUrl.contains('watch?v='))
         {
-          'file_data': {
-            'file_uri': youtubeUrl,
-            'mime_type': 'video/mp4',
-          },
+          'file_data': {'file_uri': youtubeUrl, 'mime_type': 'video/mp4'},
         },
     ];
     final json = await _geminiGenerate(apiKey: apiKey, parts: parts);
     return parseHooks(_extractGeminiText(json), videoDuration);
-  }
-
-  String _systemBrief(Duration videoDuration) {
-    return 'Pilih hook viral dari video durasi ${videoDuration.inSeconds}s. '
-        'Target 5–10 klip, durasi 30–90 detik, sebar di awal/tengah/akhir.';
   }
 
   Future<Map<String, dynamic>> _geminiGenerate({
@@ -402,16 +594,6 @@ class ClipAiService {
     return buf.toString();
   }
 
-  String _trimTranscript(String transcript) {
-    final text = transcript.trim();
-    if (text.length <= _clipPlanMaxChars) return text;
-    final section = _clipPlanMaxChars ~/ 3;
-    final midStart = math.max(0, text.length ~/ 2 - section ~/ 2);
-    return '${text.substring(0, section)}\n--- BAGIAN TENGAH ---\n'
-        '${text.substring(midStart, midStart + section)}\n'
-        '--- BAGIAN AKHIR ---\n${text.substring(text.length - section)}';
-  }
-
   ({String boundary, List<int> bytes}) _multipart({
     required String model,
     required String fileName,
@@ -430,6 +612,9 @@ class ClipAiService {
 
     field('model', model);
     field('response_format', 'verbose_json');
+    field('temperature', '0');
+    field('timestamp_granularities[]', 'word');
+    field('timestamp_granularities[]', 'segment');
     buf.addAll(utf8.encode('--$boundary\r\n'));
     buf.addAll(
       utf8.encode(
@@ -468,8 +653,10 @@ class ClipAiService {
       if (start == null || end == null || end <= start) continue;
       var s = start.clamp(0, maxSec).toDouble();
       var e = end.clamp(0, maxSec).toDouble();
-      if (e - s < 15) continue;
-      if (e - s > 180) e = s + 180;
+      if (e - s < GetClipConfig.minClipSec) continue;
+      if (e - s > GetClipConfig.maxClipSec) {
+        e = s + GetClipConfig.maxClipSec;
+      }
       final key = '${s.toStringAsFixed(1)}-${e.toStringAsFixed(1)}';
       if (seen.contains(key)) continue;
       seen.add(key);
@@ -492,7 +679,7 @@ class ClipAiService {
           score: score,
         ),
       );
-      if (out.length >= 12) break;
+      if (out.length >= GetClipConfig.maxClips) break;
     }
     out.sort((a, b) => (b.score ?? 0).compareTo(a.score ?? 0));
     return out;

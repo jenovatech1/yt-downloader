@@ -9,7 +9,9 @@ class NotificationService {
 
   static const channelId = 'yt_download_channel';
   static const channelName = 'Download Video';
+  /// ID FGS + progress (jangan dipakai untuk notif selesai).
   static const downloadNotificationId = 888;
+  static const completedNotificationId = 889;
 
   final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
@@ -79,8 +81,9 @@ class NotificationService {
 
   Future<void> showCompleted(String title, String quality) async {
     await init();
+    await cancelDownloadNotification();
     await _plugin.show(
-      id: downloadNotificationId,
+      id: completedNotificationId,
       title: 'Download selesai',
       body: '$title ($quality) tersimpan ke galeri',
       notificationDetails: const NotificationDetails(
@@ -90,6 +93,7 @@ class NotificationService {
           importance: Importance.defaultImportance,
           priority: Priority.defaultPriority,
           autoCancel: true,
+          ongoing: false,
         ),
       ),
     );
@@ -97,8 +101,9 @@ class NotificationService {
 
   Future<void> showError(String title, String message) async {
     await init();
+    await cancelDownloadNotification();
     await _plugin.show(
-      id: downloadNotificationId,
+      id: completedNotificationId,
       title: 'Download gagal',
       body: '$title — $message',
       notificationDetails: const NotificationDetails(
@@ -108,6 +113,7 @@ class NotificationService {
           importance: Importance.high,
           priority: Priority.high,
           autoCancel: true,
+          ongoing: false,
         ),
       ),
     );

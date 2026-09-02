@@ -36,6 +36,10 @@ class DownloadManager with WidgetsBindingObserver {
     await NotificationService.instance.init();
     await _configureBackgroundService();
     _registerLifecycleObserver();
+    // Bersihkan notif FGS macet dari sesi sebelumnya.
+    if (!_running) {
+      unawaited(_forceClearDownloadChrome());
+    }
   }
 
   void _registerLifecycleObserver() {
@@ -46,6 +50,10 @@ class DownloadManager with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && !_running) {
+      unawaited(_forceClearDownloadChrome());
+      return;
+    }
     if (!_running) return;
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden ||
@@ -120,6 +128,8 @@ class DownloadManager with WidgetsBindingObserver {
       lastExportedTitle = video.title;
 
       await _stopForegroundService();
+      // FGS kadang nulis ulang "Mengunduh video..." — bersihkan paksa.
+      await _forceClearDownloadChrome();
       await NotificationService.instance.showCompleted(
         video.title,
         option.label,
@@ -138,6 +148,7 @@ class DownloadManager with WidgetsBindingObserver {
       );
     } catch (e) {
       await _stopForegroundService();
+      await _forceClearDownloadChrome();
       await NotificationService.instance.showError(video.title, '$e');
 
       _emit(
@@ -172,17 +183,23 @@ class DownloadManager with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _stopForegroundService() async {
-    final service = FlutterBackgroundService();
-    if (await service.isRunning()) {
-      service.invoke('stopService');
-      for (var i = 0; i < 10; i++) {
-        await Future<void>.delayed(const Duration(milliseconds: 100));
-        if (!await service.isRunning()) break;
+  Future<void> _forceClearDownloadChrome() async {
+    try {
+      final service = FlutterBackgroundService();
+      if (await service.isRunning()) {
+        service.invoke('stopService');
+        for (var i = 0; i < 15; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 120));
+          if (!await service.isRunning()) break;
+        }
       }
-    }
+    } catch (_) {}
     _foregroundServiceActive = false;
     await NotificationService.instance.cancelDownloadNotification();
+  }
+
+  Future<void> _stopForegroundService() async {
+    await _forceClearDownloadChrome();
   }
 
   void _emit(DownloadProgress progress, {bool forceNotif = false}) {

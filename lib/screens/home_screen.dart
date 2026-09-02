@@ -7,6 +7,7 @@ import '../services/youtube_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/update_dialog.dart';
 import '../widgets/video_tile.dart';
+import 'campaign_screen.dart';
 import 'player_screen.dart';
 import 'settings_screen.dart';
 
@@ -183,7 +184,20 @@ class _HomeScreenState extends State<HomeScreen> {
                       );
                     },
                   ),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 12),
+                  OutlinedButton.icon(
+                    onPressed: () => Navigator.of(context).push(
+                      MaterialPageRoute(builder: (_) => const CampaignScreen()),
+                    ),
+                    icon: const Icon(Icons.campaign_outlined),
+                    label: const Text('Campaign & Channel YT'),
+                    style: OutlinedButton.styleFrom(
+                      minimumSize: const Size.fromHeight(44),
+                      foregroundColor: AppColors.primary,
+                      side: BorderSide(color: AppColors.primary.withValues(alpha: 0.4)),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
                   Row(
                     children: [
                       Expanded(

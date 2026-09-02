@@ -4,6 +4,10 @@ import 'dart:math' as math;
 
 import 'package:extractor/extractor.dart';
 import 'package:path/path.dart' as p;
+import 'package:youtube_explode_dart/youtube_explode_dart.dart';
+
+import 'clip_section_downloader.dart';
+import 'ytdlp_exec_channel.dart';
 
 /// Snapshot progress unduhan yt-dlp (%, byte, kecepatan).
 class YtDownloadProgress {
@@ -39,10 +43,7 @@ class YtDlpService {
 
   Future<void> _doInit() async {
     if (_ready) return;
-    final init = await _dl.initialize(
-      enableFFmpeg: true,
-      enableAria2c: false,
-    );
+    final init = await _dl.initialize(enableFFmpeg: true, enableAria2c: true);
     if (!init.success) {
       _initFuture = null;
       throw Exception(init.errorMessage ?? 'Gagal init yt-dlp');
@@ -59,48 +60,117 @@ class YtDlpService {
 
   static String formatForHeight(int height) {
     final h = height.clamp(144, 1080);
-    return 'bestvideo[height<=$h][ext=mp4]+bestaudio[ext=m4a]/'
-        'bestvideo[height<=$h]+bestaudio/'
-        'best[height<=$h]/best';
+    const a =
+        '(bestaudio[format_note*=original][ext=m4a]/'
+        'bestaudio[format_note*=original]/'
+        'bestaudio[ext=m4a]/bestaudio)';
+    // Prefer H.264 (avc1) biar Klippod/FFprobe bisa baca width/height.
+    // JANGAN fallback ke bare `best` — yt-dlp treat warning itu sebagai gagal.
+    return 'bestvideo[height<=$h][vcodec^=avc1][ext=mp4]+$a/'
+        'bestvideo[height<=$h][vcodec*=avc1]+$a/'
+        'bestvideo[height<=$h][vcodec^=avc]+$a/'
+        'bestvideo[height<=$h][ext=mp4]+$a/'
+        'bestvideo[height<=$h]+$a/'
+        'bestvideo[height<=360]+$a/'
+        'bv*+ba/b';
+  }
+
+  /// Section: DASH only (tanpa muxed `b`) biar YouTube tidak throttle ~0.2 Mbps.
+  static String formatForSection(int height) {
+    final h = height.clamp(144, 1080);
+    const a =
+        '(bestaudio[format_note*=original][ext=m4a]/'
+        'bestaudio[format_note*=original]/'
+        'bestaudio[ext=m4a]/bestaudio)';
+    return 'bestvideo[height<=$h][vcodec^=avc1][ext=mp4]+$a/'
+        'bestvideo[height<=$h][vcodec*=avc1]+$a/'
+        'bestvideo[height<=$h][ext=mp4]+$a/'
+        'bestvideo[height<=$h]+$a/'
+        'bv*+ba';
   }
 
   Map<String?, String?> get _baseArgs => {
-        '--extractor-args': 'youtube:player_client=default,-android_sdkless',
-        '--merge-output-format': 'mp4',
-        '--retries': '15',
-        '--fragment-retries': '15',
-      };
+    '--extractor-args': 'youtube:player_client=default,-android_sdkless',
+    '--merge-output-format': 'mp4',
+    '--retries': '15',
+    '--fragment-retries': '15',
+    '--concurrent-fragments': '16',
+  };
 
-  Future<String> downloadVideo({
+  /// Estimasi byte satu potongan dari ukuran video full (bukan tebak 500KB/s).
+  static int estimateSectionBytes({
+    required double startSec,
+    required double endSec,
+    int fullVideoBytes = 0,
+    double videoDurationSec = 0,
+  }) {
+    final sec = (endSec - startSec).clamp(30.0, 120.0);
+    if (fullVideoBytes > 0 && videoDurationSec > 0) {
+      return (fullVideoBytes * sec / videoDurationSec * 1.05).round().clamp(
+        256 * 1024,
+        fullVideoBytes,
+      );
+    }
+    return (sec * 280 * 1024).round();
+  }
+
+  Map<String?, String?> _sectionEngineArgs({
+    required double sectionStart,
+    required double sectionEnd,
+  }) {
+    final custom = Map<String?, String?>.from(_baseArgs);
+    custom['--download-sections'] =
+        '*${sectionStart.toStringAsFixed(3)}-${sectionEnd.toStringAsFixed(3)}';
+    custom['--remux-video'] = 'mp4';
+    custom['--postprocessor-args'] = 'ffmpeg:-movflags +faststart';
+    return custom;
+  }
+
+  /// Config hanya berisi daftar --download-sections (engine lewat customOptions).
+  Future<File> _writeSectionsOnlyConfig({
+    required String outputDir,
+    required List<ClipSection> sections,
+  }) async {
+    final sb = StringBuffer();
+    for (final s in sections) {
+      sb.writeln(
+        '--download-sections "*${s.startSec.toStringAsFixed(3)}-${s.endSec.toStringAsFixed(3)}"',
+      );
+    }
+    final f = File(p.join(outputDir, 'clip_sections.conf'));
+    await f.writeAsString(sb.toString());
+    return f;
+  }
+
+  /// Potongan via yt-dlp --download-sections (FFmpeg linear, LAMBAT).
+  /// Get Clip pakai [ClipSectionDownloader] + DASH fragment, bukan ini.
+  Future<String> downloadVideoSection({
     required String videoId,
     required int height,
+    required double sectionStart,
+    required double sectionEnd,
     required String outputDir,
     required YtProgressCallback onProgress,
     int estimatedTotalBytes = 0,
-    double? sectionStart,
-    double? sectionEnd,
   }) async {
     await ensureReady();
     await Directory(outputDir).create(recursive: true);
 
     final processId =
-        'v_${videoId}_${DateTime.now().millisecondsSinceEpoch}';
+        'vsec_${videoId}_${DateTime.now().millisecondsSinceEpoch}';
     final url = 'https://www.youtube.com/watch?v=$videoId';
-    final custom = Map<String?, String?>.from(_baseArgs);
-    if (sectionStart != null &&
-        sectionEnd != null &&
-        sectionEnd > sectionStart) {
-      custom['--download-sections'] =
-          '*${sectionStart.toStringAsFixed(3)}-${sectionEnd.toStringAsFixed(3)}';
-      // Flag tanpa argumen — JANGAN kasih 'true' (yt-dlp anggap URL).
-      custom['--force-keyframes-at-cuts'] = null;
-    }
+    final custom = _sectionEngineArgs(
+      sectionStart: sectionStart,
+      sectionEnd: sectionEnd,
+    );
 
     final tracker = _ProgressTracker(
       processId: processId,
-      phaseLabel: 'Mengunduh (yt-dlp)...',
+      phaseLabel: 'Mengunduh potongan (yt-dlp)...',
       estimatedTotalBytes: estimatedTotalBytes,
       onProgress: onProgress,
+      lockSlimEstimate: estimatedTotalBytes > 0,
+      watchDir: outputDir,
     );
     final subs = tracker.bind(_dl);
 
@@ -108,7 +178,7 @@ class YtDlpService {
       onProgress(
         YtDownloadProgress(
           progress01: 0.02,
-          phase: 'Menyiapkan yt-dlp...',
+          phase: 'Mengunduh potongan (yt-dlp)...',
           totalBytes: estimatedTotalBytes,
         ),
       );
@@ -116,9 +186,7 @@ class YtDlpService {
         DownloadRequest(
           url: url,
           outputPath: outputDir,
-          outputTemplate: sectionStart != null
-              ? '%(id)s_clip_%(autonumber)s.%(ext)s'
-              : '%(id)s_%(height)sp.%(ext)s',
+          outputTemplate: '%(id)s_clip.%(ext)s',
           format: formatForHeight(height),
           noPlaylist: true,
           processId: processId,
@@ -126,7 +194,24 @@ class YtDlpService {
         ),
       );
       if (result.status != OperationStatus.success) {
-        throw Exception(result.errorMessage ?? 'yt-dlp gagal unduh video');
+        final recovered = await _tryRecoverOutput(
+          outputDir: outputDir,
+          preferred: result.outputPath,
+          videoId: videoId,
+        );
+        if (recovered != null) {
+          final size = await File(recovered).length();
+          onProgress(
+            YtDownloadProgress(
+              progress01: 1,
+              phase: 'Selesai unduh',
+              downloadedBytes: size,
+              totalBytes: size,
+            ),
+          );
+          return recovered;
+        }
+        throw Exception(result.errorMessage ?? 'yt-dlp gagal unduh potongan');
       }
       final out = await _findOutput(
         outputDir,
@@ -148,11 +233,314 @@ class YtDlpService {
     }
   }
 
+  Future<String> downloadVideo({
+    required String videoId,
+    required int height,
+    required String outputDir,
+    required YtProgressCallback onProgress,
+    int estimatedTotalBytes = 0,
+    double? sectionStart,
+    double? sectionEnd,
+    Duration? videoDuration,
+  }) async {
+    await ensureReady();
+    await Directory(outputDir).create(recursive: true);
+
+    final isSection =
+        sectionStart != null && sectionEnd != null && sectionEnd > sectionStart;
+
+    if (isSection) {
+      return downloadVideoSection(
+        videoId: videoId,
+        height: height,
+        sectionStart: sectionStart,
+        sectionEnd: sectionEnd,
+        outputDir: outputDir,
+        onProgress: onProgress,
+        estimatedTotalBytes: estimatedTotalBytes,
+      );
+    }
+
+    final processId = 'v_${videoId}_${DateTime.now().millisecondsSinceEpoch}';
+    final url = 'https://www.youtube.com/watch?v=$videoId';
+    final custom = Map<String?, String?>.from(_baseArgs);
+
+    final tracker = _ProgressTracker(
+      processId: processId,
+      phaseLabel: 'Mengunduh (yt-dlp)...',
+      estimatedTotalBytes: estimatedTotalBytes,
+      onProgress: onProgress,
+      watchDir: outputDir,
+    );
+    final subs = tracker.bind(_dl);
+
+    try {
+      onProgress(
+        YtDownloadProgress(
+          progress01: 0.02,
+          phase: 'Menyiapkan yt-dlp...',
+          totalBytes: estimatedTotalBytes,
+        ),
+      );
+      final result = await _dl.download(
+        DownloadRequest(
+          url: url,
+          outputPath: outputDir,
+          outputTemplate: '%(id)s_%(height)sp.%(ext)s',
+          format: formatForHeight(height),
+          noPlaylist: true,
+          processId: processId,
+          customOptions: custom,
+        ),
+      );
+      if (result.status != OperationStatus.success) {
+        final recovered = await _tryRecoverOutput(
+          outputDir: outputDir,
+          preferred: result.outputPath,
+          videoId: videoId,
+        );
+        if (recovered != null) {
+          final size = await File(recovered).length();
+          onProgress(
+            YtDownloadProgress(
+              progress01: 1,
+              phase: 'Selesai unduh',
+              downloadedBytes: size,
+              totalBytes: size,
+            ),
+          );
+          return recovered;
+        }
+        final err = result.errorMessage ?? 'yt-dlp gagal unduh video';
+        if (_isBenignYtDlpWarning(err)) {
+          throw Exception(
+            'Unduh gagal setelah peringatan yt-dlp. Coba lagi atau ganti kualitas.',
+          );
+        }
+        throw Exception(err);
+      }
+      final out = await _findOutput(
+        outputDir,
+        preferred: result.outputPath,
+        videoId: videoId,
+      );
+      final size = await File(out).length();
+      onProgress(
+        YtDownloadProgress(
+          progress01: 1,
+          phase: 'Selesai unduh',
+          downloadedBytes: size,
+          totalBytes: size,
+        ),
+      );
+      return out;
+    } finally {
+      await subs.cancel();
+    }
+  }
+
+  /// Alias — pakai [downloadVideoSection].
+  Future<String> downloadVideoSectionFallback({
+    required String videoId,
+    required int height,
+    required double sectionStart,
+    required double sectionEnd,
+    required String outputDir,
+    required YtProgressCallback onProgress,
+    int estimatedTotalBytes = 0,
+  }) => downloadVideoSection(
+    videoId: videoId,
+    height: height,
+    sectionStart: sectionStart,
+    sectionEnd: sectionEnd,
+    outputDir: outputDir,
+    onProgress: onProgress,
+    estimatedTotalBytes: estimatedTotalBytes,
+  );
+
+  /// Satu yt-dlp init untuk banyak potongan.
+  Future<List<String>> downloadVideoSectionsBatch({
+    required String videoId,
+    required int height,
+    required String outputDir,
+    required List<ClipSection> sections,
+    required YtProgressCallback onProgress,
+    int estimatedTotalBytes = 0,
+  }) async {
+    if (sections.isEmpty) return [];
+    await ensureReady();
+    await Directory(outputDir).create(recursive: true);
+
+    final confFile = await _writeSectionsOnlyConfig(
+      outputDir: outputDir,
+      sections: sections,
+    );
+
+    final processId =
+        'vbatch_${videoId}_${DateTime.now().millisecondsSinceEpoch}';
+    final url = 'https://www.youtube.com/watch?v=$videoId';
+    final custom = Map<String?, String?>.from(_baseArgs);
+    custom['--config-location'] = confFile.path;
+    custom['--remux-video'] = 'mp4';
+    custom['--postprocessor-args'] = 'ffmpeg:-movflags +faststart';
+
+    final tracker = _ProgressTracker(
+      processId: processId,
+      phaseLabel: 'Mengunduh potongan (yt-dlp)...',
+      estimatedTotalBytes: estimatedTotalBytes,
+      onProgress: onProgress,
+      lockSlimEstimate: estimatedTotalBytes > 0,
+      watchDir: outputDir,
+    );
+    final subs = tracker.bind(_dl);
+
+    try {
+      onProgress(
+        YtDownloadProgress(
+          progress01: 0.02,
+          phase: 'yt-dlp: mengekstrak info video...',
+          totalBytes: estimatedTotalBytes,
+        ),
+      );
+      final result = await _dl.download(
+        DownloadRequest(
+          url: url,
+          outputPath: outputDir,
+          outputTemplate: '%(id)s_clip_%(autonumber)03d.%(ext)s',
+          format: formatForHeight(height),
+          noPlaylist: true,
+          processId: processId,
+          customOptions: custom,
+        ),
+      );
+      if (result.status != OperationStatus.success) {
+        final recovered = await _collectClipOutputs(outputDir, videoId);
+        if (recovered.length >= sections.length) return recovered;
+        throw Exception(result.errorMessage ?? 'yt-dlp batch potongan gagal');
+      }
+      final outs = await _collectClipOutputs(outputDir, videoId);
+      if (outs.length < sections.length) {
+        throw Exception(
+          'Hanya ${outs.length}/${sections.length} potongan dari yt-dlp',
+        );
+      }
+      onProgress(
+        YtDownloadProgress(
+          progress01: 1,
+          phase: 'Selesai unduh batch',
+          downloadedBytes: estimatedTotalBytes,
+          totalBytes: estimatedTotalBytes,
+        ),
+      );
+      return outs.take(sections.length).toList();
+    } finally {
+      await subs.cancel();
+    }
+  }
+
+  Future<List<String>> _collectClipOutputs(String dir, String videoId) async {
+    final folder = Directory(dir);
+    if (!await folder.exists()) return [];
+    final files = <File>[];
+    await for (final entity in folder.list(recursive: true)) {
+      if (entity is! File) continue;
+      final ext = p.extension(entity.path).toLowerCase();
+      if ({'.mp4', '.mkv', '.webm'}.contains(ext)) {
+        files.add(entity);
+      }
+    }
+    files.sort((a, b) => a.path.compareTo(b.path));
+    final out = <String>[];
+    for (final f in files) {
+      if (await f.length() > 2048) out.add(f.path);
+    }
+    return out;
+  }
+
+  /// Potong klip dari file video lokal (ffmpeg copy — cepat, tanpa re-encode).
+  Future<String> cutClipFromFile({
+    required String sourcePath,
+    required String outputDir,
+    required double startSec,
+    required double endSec,
+    required YtProgressCallback onProgress,
+  }) {
+    final dur = (endSec - startSec).clamp(0.5, 600.0);
+    return remuxLocalClip(
+      videoPath: sourcePath,
+      outputDir: outputDir,
+      trimStartSec: startSec,
+      durationSec: dur,
+      onProgress: onProgress,
+    );
+  }
+
+  /// Trim + mux file lokal hasil unduh HLS segment.
+  Future<String> remuxLocalClip({
+    required String videoPath,
+    required String outputDir,
+    required double trimStartSec,
+    required double durationSec,
+    required YtProgressCallback onProgress,
+    String? audioPath,
+    double? audioTrimStartSec,
+  }) async {
+    await ensureReady();
+    await Directory(outputDir).create(recursive: true);
+
+    final vSize = await File(videoPath).length();
+    final aSize = audioPath != null ? await File(audioPath).length() : 0;
+    final estBytes = vSize + aSize;
+    onProgress(
+      YtDownloadProgress(
+        progress01: 0.85,
+        phase: audioPath == null
+            ? 'Merapikan potongan...'
+            : 'Menggabungkan audio+video...',
+        downloadedBytes: (estBytes * 0.85).round(),
+        totalBytes: estBytes,
+      ),
+    );
+
+    final outputPath = p.join(outputDir, 'clip.mp4');
+    final result = await YtdlpExecChannel.instance.muxLocalClip(
+      videoPath: videoPath,
+      audioPath: audioPath,
+      outputPath: outputPath,
+      videoTrimStartSec: trimStartSec,
+      audioTrimStartSec: audioTrimStartSec,
+      durationSec: durationSec,
+    );
+    final size = await File(result).length();
+    onProgress(
+      YtDownloadProgress(
+        progress01: 1,
+        phase: 'Klip siap',
+        downloadedBytes: size,
+        totalBytes: size,
+      ),
+    );
+    return result;
+  }
+
   /// Audio untuk Whisper: mono 16kHz 32kbps (sama desktop Klippod).
   /// Cap ~85 menit biar tetap di bawah limit upload Groq ~23 MB.
   static const groqMaxUploadBytes = 23 * 1024 * 1024;
   static const transcribeMaxSeconds = 85 * 60;
   static const slimAudioBytesPerSec = 4000; // 32 kbps
+
+  /// DASH audio-only — engine sama unduh video, tanpa FFmpeg manual.
+  static const _transcribeAudioFormat =
+      'bestaudio[format_note*=original][ext=m4a]/'
+      'bestaudio[format_note*=original]/'
+      'bestaudio[ext=m4a]/bestaudio/ba/worst';
+
+  /// Fallback kalau m4a masih >23 MB: yt-dlp extract MP3 (FFmpeg internal).
+  static const _transcribeSlimFormat =
+      'ba[format_note*=original][abr<=48]/'
+      'ba[format_note*=original][abr<=64]/'
+      'ba[format_note*=original]/'
+      'ba[abr<=48]/ba[abr<=64]/worstaudio/ba/worst';
 
   Future<String> downloadAudio({
     required String videoId,
@@ -164,44 +552,105 @@ class YtDlpService {
     await ensureReady();
     await Directory(outputDir).create(recursive: true);
 
-    final processId = 'a_${videoId}_${DateTime.now().millisecondsSinceEpoch}';
-    final url = 'https://www.youtube.com/watch?v=$videoId';
     final durSec = videoDuration?.inSeconds ?? 0;
     final capSec = forTranscribe
         ? (durSec > 0
-            ? math.min(durSec, transcribeMaxSeconds)
-            : transcribeMaxSeconds)
+              ? math.min(durSec, transcribeMaxSeconds)
+              : transcribeMaxSeconds)
         : (durSec > 0 ? durSec : 0);
-    final estimated = forTranscribe
-        ? (capSec > 0 ? capSec * slimAudioBytesPerSec : 8 * 1024 * 1024)
-        : 0;
+
+    if (!forTranscribe) {
+      return _downloadAudioDash(
+        videoId: videoId,
+        outputDir: outputDir,
+        onProgress: onProgress,
+        format:
+            'bestaudio[format_note*=original][ext=m4a]/'
+            'bestaudio[format_note*=original]/'
+            'bestaudio[ext=m4a]/bestaudio/best',
+        extractAudio: false,
+      );
+    }
+
+    // Selalu slim 32kbps mono — video 25–60 menit full m4a bikin Groq Whisper lambat.
+    final estimated = capSec > 0
+        ? capSec * slimAudioBytesPerSec
+        : 8 * 1024 * 1024;
+    return _downloadAudioDash(
+      videoId: videoId,
+      outputDir: outputDir,
+      onProgress: onProgress,
+      format: _transcribeSlimFormat,
+      extractAudio: true,
+      capSec: capSec,
+      estimated: estimated,
+      phase: 'Mengunduh audio untuk Whisper...',
+    );
+  }
+
+  Future<int> _estimateAudioBytes(
+    String videoId, {
+    int capSec = 0,
+    int durSec = 0,
+  }) async {
+    final yt = YoutubeExplode();
+    try {
+      final manifest = await yt.videos.streamsClient.getManifest(
+        videoId,
+        ytClients: [YoutubeApiClient.androidSdkless, YoutubeApiClient.ios],
+      );
+      var bytes = 0;
+      for (final a in manifest.audioOnly) {
+        if (bytes <= 0 || a.size.totalBytes < bytes) {
+          bytes = a.size.totalBytes;
+        }
+      }
+      if (bytes > 0 && durSec > 0 && capSec > 0 && capSec < durSec) {
+        bytes = (bytes * capSec / durSec).round();
+      }
+      if (bytes > 0) return bytes;
+    } catch (_) {
+    } finally {
+      yt.close();
+    }
+    if (capSec > 0) return capSec * slimAudioBytesPerSec;
+    return 8 * 1024 * 1024;
+  }
+
+  Future<String> _downloadAudioDash({
+    required String videoId,
+    required String outputDir,
+    required YtProgressCallback onProgress,
+    required String format,
+    required bool extractAudio,
+    int estimated = 0,
+    int capSec = 0,
+    String phase = 'Mengunduh audio (yt-dlp)...',
+  }) async {
+    final processId = 'a_${videoId}_${DateTime.now().millisecondsSinceEpoch}';
+    final url = 'https://www.youtube.com/watch?v=$videoId';
 
     final tracker = _ProgressTracker(
       processId: processId,
-      phaseLabel: 'Mengunduh audio...',
+      phaseLabel: phase,
       onProgress: onProgress,
       estimatedTotalBytes: estimated,
-      watchDir: outputDir,
+      lockSlimEstimate: extractAudio && estimated > 0,
     );
     final subs = tracker.bind(_dl);
 
     final custom = Map<String?, String?>.from(_baseArgs);
-    if (forTranscribe) {
-      // FFmpeg post: mono / 16kHz / 32k ? file kecil untuk Whisper.
-      custom['--postprocessor-args'] = 'ffmpeg:-ac 1 -ar 16000 -b:a 32k';
-      if (durSec > transcribeMaxSeconds) {
-        custom['--download-sections'] =
-            '*0-${transcribeMaxSeconds.toDouble()}';
-      }
+    custom['--concurrent-fragments'] = '4';
+    if (extractAudio && capSec > 0) {
+      custom['--postprocessor-args'] =
+          'ffmpeg:-ac 1 -ar 16000 -b:a 32k -t $capSec';
     }
 
     try {
       onProgress(
         YtDownloadProgress(
           progress01: 0.02,
-          phase: forTranscribe
-              ? 'Menyiapkan audio slim (32kbps)...'
-              : 'Menyiapkan audio...',
+          phase: phase,
           totalBytes: estimated,
         ),
       );
@@ -210,16 +659,36 @@ class YtDlpService {
           url: url,
           outputPath: outputDir,
           outputTemplate: '%(id)s_audio.%(ext)s',
-          format: 'bestaudio/best',
-          extractAudio: true,
-          audioFormat: forTranscribe ? 'mp3' : 'm4a',
-          audioQuality: forTranscribe ? 9 : 5,
+          format: format,
+          extractAudio: extractAudio,
+          audioFormat: extractAudio ? 'mp3' : null,
+          audioQuality: extractAudio ? 9 : null,
           noPlaylist: true,
           processId: processId,
           customOptions: custom,
         ),
       );
       if (result.status != OperationStatus.success) {
+        try {
+          final recovered = await _findOutput(
+            outputDir,
+            preferred: result.outputPath,
+            videoId: videoId,
+            audioOnly: true,
+          );
+          final rs = await File(recovered).length();
+          if (rs > 1024 && rs <= groqMaxUploadBytes) {
+            onProgress(
+              YtDownloadProgress(
+                progress01: 1,
+                phase: 'Audio siap',
+                downloadedBytes: rs,
+                totalBytes: rs,
+              ),
+            );
+            return recovered;
+          }
+        } catch (_) {}
         throw Exception(result.errorMessage ?? 'yt-dlp gagal unduh audio');
       }
       final out = await _findOutput(
@@ -229,7 +698,7 @@ class YtDlpService {
         audioOnly: true,
       );
       final size = await File(out).length();
-      if (forTranscribe && size > groqMaxUploadBytes) {
+      if (extractAudio && size > groqMaxUploadBytes) {
         throw Exception(
           'Audio hasil ${(size / (1024 * 1024)).toStringAsFixed(1)} MB '
           'masih di atas limit Groq ~23 MB. Coba video lebih pendek.',
@@ -249,15 +718,52 @@ class YtDlpService {
     }
   }
 
+  static const _audioExts = {'.m4a', '.mp3', '.opus', '.ogg', '.wav'};
+
+  static bool _isBenignYtDlpWarning(String message) {
+    final l = message.toLowerCase();
+    if (!l.contains('warning')) return false;
+    return l.contains('skipped') ||
+        l.contains('missing a url') ||
+        l.contains('ios client') ||
+        l.contains('falling back');
+  }
+
+  Future<String?> _tryRecoverOutput({
+    required String outputDir,
+    String? preferred,
+    required String videoId,
+    bool audioOnly = false,
+    int minBytes = 2048,
+  }) async {
+    try {
+      final path = await _findOutput(
+        outputDir,
+        preferred: preferred,
+        videoId: videoId,
+        audioOnly: audioOnly,
+      );
+      if (await File(path).length() > minBytes) return path;
+    } catch (_) {}
+    return null;
+  }
+
   Future<String> _findOutput(
     String dir, {
     String? preferred,
     required String videoId,
     bool audioOnly = false,
   }) async {
+    bool okAudio(String path) {
+      final ext = p.extension(path).toLowerCase();
+      return _audioExts.contains(ext);
+    }
+
     if (preferred != null && preferred.isNotEmpty) {
       final f = File(preferred);
-      if (await f.exists() && await f.length() > 2048) return preferred;
+      if (await f.exists() && await f.length() > 1024) {
+        if (!audioOnly || okAudio(preferred)) return preferred;
+      }
       if (await Directory(preferred).exists()) dir = preferred;
     }
 
@@ -267,7 +773,7 @@ class YtDlpService {
     }
 
     final files = await folder
-        .list()
+        .list(recursive: audioOnly)
         .where((e) => e is File)
         .cast<File>()
         .toList();
@@ -276,22 +782,24 @@ class YtDlpService {
     );
 
     for (final f in files) {
-      final name = p.basename(f.path).toLowerCase();
-      final ext = p.extension(name);
+      final ext = p.extension(f.path).toLowerCase();
       if (audioOnly) {
-        if ({'.m4a', '.mp3', '.opus', '.webm', '.ogg'}.contains(ext) &&
-            await f.length() > 1024) {
-          return f.path;
-        }
+        if (okAudio(f.path) && await f.length() > 1024) return f.path;
       } else if ({'.mp4', '.mkv', '.webm', '.mov'}.contains(ext) &&
           await f.length() > 2048) {
         return f.path;
       }
     }
-    for (final f in files) {
-      if (await f.length() > 2048) return f.path;
+    if (!audioOnly) {
+      for (final f in files) {
+        if (await f.length() > 2048) return f.path;
+      }
     }
-    throw Exception('File hasil yt-dlp kosong');
+    throw Exception(
+      audioOnly
+          ? 'Gagal extract MP3 untuk Whisper'
+          : 'File hasil yt-dlp kosong',
+    );
   }
 }
 
@@ -302,6 +810,7 @@ class _ProgressTracker {
     required this.onProgress,
     this.estimatedTotalBytes = 0,
     this.watchDir,
+    this.lockSlimEstimate = false,
   });
 
   final String processId;
@@ -309,6 +818,9 @@ class _ProgressTracker {
   final YtProgressCallback onProgress;
   final int estimatedTotalBytes;
   final String? watchDir;
+
+  /// Jangan ganti total progress dengan ukuran source besar (bestaudio).
+  final bool lockSlimEstimate;
 
   double _pct = 0;
   int _downloaded = 0;
@@ -357,10 +869,13 @@ class _ProgressTracker {
       if (log.processId != processId) return;
       _parseLog(log.message);
     });
-    return _Subs([a, b], onCancel: () {
-      _poll?.cancel();
-      _poll = null;
-    });
+    return _Subs(
+      [a, b],
+      onCancel: () {
+        _poll?.cancel();
+        _poll = null;
+      },
+    );
   }
 
   Future<void> _pollDir() async {
@@ -386,8 +901,13 @@ class _ProgressTracker {
       _downloaded = biggest;
       _lastTick = now;
       _lastDownloaded = biggest;
+      if (lockSlimEstimate && estimatedTotalBytes > 0) {
+        if (_total <= 0) _total = estimatedTotalBytes;
+      } else if (biggest > _total) {
+        _total = biggest;
+      }
       if (_total > 0) {
-        _pct = (_downloaded / _total).clamp(0.0, 0.95);
+        _pct = (_downloaded / _total).clamp(0.0, 0.99);
       } else if (_pct < 0.05) {
         _pct = 0.05;
       }
@@ -403,8 +923,22 @@ class _ProgressTracker {
     if (lower.contains('extractaudio') ||
         (lower.contains('destination') && lower.contains('mp3')) ||
         lower.contains('post-process') ||
-        lower.contains('merging')) {
-      _phase = 'Mengompres audio...';
+        lower.contains('merging') ||
+        lower.contains('[merger]') ||
+        lower.contains('remux') ||
+        lower.contains('[videoremuxer]') ||
+        lower.contains('[ffmpeg]')) {
+      if (lower.contains('extractaudio') || lower.contains('mp3')) {
+        _phase = 'Mengompres audio...';
+      } else if (lower.contains('remux') || lower.contains('videoremuxer')) {
+        _phase = 'Remux potongan...';
+      } else if (lower.contains('merging') || lower.contains('[merger]')) {
+        _phase = 'Menggabungkan audio+video...';
+      } else if (lower.contains('[ffmpeg]')) {
+        _phase = 'Proses FFmpeg...';
+      } else {
+        _phase = 'Memproses file...';
+      }
       if (_pct < 0.85) _pct = 0.85;
       _emit();
     }
@@ -418,7 +952,9 @@ class _ProgressTracker {
     // Untuk mode slim, total dari log bisa jauh lebih besar (source
     // sebelum compress). Pakai estimasi slim kalau sudah ada.
     if (total != null && total > 0) {
-      if (estimatedTotalBytes <= 0 || total <= estimatedTotalBytes * 1.5) {
+      if (lockSlimEstimate && estimatedTotalBytes > 0) {
+        if (_total <= 0) _total = estimatedTotalBytes;
+      } else if (total > _total) {
         _total = total;
       }
     }
@@ -439,7 +975,13 @@ class _ProgressTracker {
     }
     _lastTick = now;
     _lastDownloaded = _downloaded;
-    _phase = phaseLabel;
+    if (!_phase.contains('Remux') &&
+        !_phase.contains('Menggabung') &&
+        !_phase.contains('FFmpeg') &&
+        !_phase.contains('Memproses') &&
+        !_phase.contains('Mengompres')) {
+      _phase = phaseLabel;
+    }
     _emit();
   }
 
