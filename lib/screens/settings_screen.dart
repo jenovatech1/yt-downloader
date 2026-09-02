@@ -50,9 +50,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await ApiKeysService.instance.saveHookProvider(_hookProvider);
     if (!mounted) return;
     setState(() => _saving = false);
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('API key tersimpan')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('API key tersimpan')));
   }
 
   @override
@@ -70,7 +70,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : ListView(
-              padding: const EdgeInsets.all(20),
+              padding: EdgeInsets.fromLTRB(
+                20,
+                20,
+                20,
+                48 + MediaQuery.viewPaddingOf(context).bottom,
+              ),
               children: [
                 Text(
                   'API key untuk Get Clip',
@@ -182,18 +187,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       children: [
                         Text(
                           'Aplikasi',
-                          style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                            fontWeight: FontWeight.w700,
-                          ),
+                          style: Theme.of(context).textTheme.titleMedium
+                              ?.copyWith(fontWeight: FontWeight.w700),
                         ),
                         const SizedBox(height: 8),
                         Text(
                           current.isEmpty
                               ? 'Versi terpasang'
                               : 'Versi terpasang: $current',
-                          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                            color: Theme.of(context).colorScheme.onSurfaceVariant,
-                          ),
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(
+                                color: Theme.of(
+                                  context,
+                                ).colorScheme.onSurfaceVariant,
+                              ),
                         ),
                         const SizedBox(height: 12),
                         if (update != null)
@@ -209,7 +216,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         else
                           OutlinedButton(
                             onPressed: () async {
-                              final found = await AppUpdateService.instance.check();
+                              final found = await AppUpdateService.instance
+                                  .check();
                               if (!context.mounted) return;
                               ScaffoldMessenger.of(context).showSnackBar(
                                 SnackBar(
