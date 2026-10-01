@@ -17,9 +17,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _groq = TextEditingController();
   final _gemini = TextEditingController();
   final _openrouter = TextEditingController();
+  bool _saving = false;
   ClipHookProvider _hookProvider = ClipHookProvider.auto;
   bool _loading = true;
-  bool _saving = false;
 
   @override
   void initState() {
@@ -44,15 +44,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _save() async {
     setState(() => _saving = true);
-    await ApiKeysService.instance.saveGroqKey(_groq.text);
-    await ApiKeysService.instance.saveGeminiKey(_gemini.text);
-    await ApiKeysService.instance.saveOpenrouterKey(_openrouter.text);
-    await ApiKeysService.instance.saveHookProvider(_hookProvider);
-    if (!mounted) return;
-    setState(() => _saving = false);
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('API key tersimpan')));
+    try {
+      await ApiKeysService.instance.saveGroqKey(_groq.text);
+      await ApiKeysService.instance.saveGeminiKey(_gemini.text);
+      await ApiKeysService.instance.saveOpenrouterKey(_openrouter.text);
+      await ApiKeysService.instance.saveHookProvider(_hookProvider);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Tersimpan')),
+      );
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
   }
 
   @override
@@ -106,6 +109,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   onChanged: (v) {
                     if (v == null) return;
                     setState(() => _hookProvider = v);
+                    ApiKeysService.instance.saveHookProvider(v);
                   },
                 ),
                 const SizedBox(height: 20),
@@ -168,14 +172,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     child: const Text('Ambil key OpenRouter'),
                   ),
                 ),
-                const SizedBox(height: 24),
+                const SizedBox(height: 16),
                 FilledButton(
                   onPressed: _saving ? null : _save,
-                  style: FilledButton.styleFrom(
-                    minimumSize: const Size.fromHeight(48),
-                    backgroundColor: AppColors.primary,
-                  ),
-                  child: Text(_saving ? 'Menyimpan...' : 'Simpan'),
+                  child: Text(_saving ? 'Menyimpan…' : 'Simpan'),
                 ),
                 const SizedBox(height: 32),
                 ValueListenableBuilder(
