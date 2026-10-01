@@ -89,8 +89,16 @@ class YtDlpService {
         'bv*+ba';
   }
 
+  /// SABR / "page needs to be reloaded": coba client non-web dulu.
+  static const playerClients = <String>[
+    'youtube:player_client=android,ios,tv',
+    'youtube:player_client=ios,tv,mweb',
+    'youtube:player_client=tv_embedded,android',
+    'youtube:player_client=web,android',
+  ];
+
   Map<String?, String?> get _baseArgs => {
-    '--extractor-args': 'youtube:player_client=default,-android_sdkless',
+    '--extractor-args': playerClients.first,
     '--merge-output-format': 'mp4',
     '--retries': '15',
     '--fragment-retries': '15',
@@ -159,11 +167,6 @@ class YtDlpService {
     final processId =
         'vsec_${videoId}_${DateTime.now().millisecondsSinceEpoch}';
     final url = 'https://www.youtube.com/watch?v=$videoId';
-    final custom = _sectionEngineArgs(
-      sectionStart: sectionStart,
-      sectionEnd: sectionEnd,
-    );
-
     final tracker = _ProgressTracker(
       processId: processId,
       phaseLabel: 'Mengunduh potongan (yt-dlp)...',
@@ -182,25 +185,53 @@ class YtDlpService {
           totalBytes: estimatedTotalBytes,
         ),
       );
-      final result = await _dl.download(
-        DownloadRequest(
-          url: url,
-          outputPath: outputDir,
-          outputTemplate: '%(id)s_clip.%(ext)s',
-          format: formatForHeight(height),
-          noPlaylist: true,
-          processId: processId,
-          customOptions: custom,
-        ),
-      );
-      if (result.status != OperationStatus.success) {
-        final recovered = await _tryRecoverOutput(
-          outputDir: outputDir,
-          preferred: result.outputPath,
-          videoId: videoId,
+      Object? lastError;
+      for (var i = 0; i < playerClients.length; i++) {
+        final custom = _sectionEngineArgs(
+          sectionStart: sectionStart,
+          sectionEnd: sectionEnd,
         );
-        if (recovered != null) {
-          final size = await File(recovered).length();
+        custom['--extractor-args'] = playerClients[i];
+        final attemptId = '${processId}_$i';
+        try {
+          final result = await _dl.download(
+            DownloadRequest(
+              url: url,
+              outputPath: outputDir,
+              outputTemplate: '%(id)s_clip.%(ext)s',
+              format: formatForHeight(height),
+              noPlaylist: true,
+              processId: attemptId,
+              customOptions: custom,
+            ),
+          );
+          if (result.status != OperationStatus.success) {
+            lastError = result.errorMessage;
+            final recovered = await _tryRecoverOutput(
+              outputDir: outputDir,
+              preferred: result.outputPath,
+              videoId: videoId,
+            );
+            if (recovered != null) {
+              final size = await File(recovered).length();
+              onProgress(
+                YtDownloadProgress(
+                  progress01: 1,
+                  phase: 'Selesai unduh',
+                  downloadedBytes: size,
+                  totalBytes: size,
+                ),
+              );
+              return recovered;
+            }
+            continue;
+          }
+          final out = await _findOutput(
+            outputDir,
+            preferred: result.outputPath,
+            videoId: videoId,
+          );
+          final size = await File(out).length();
           onProgress(
             YtDownloadProgress(
               progress01: 1,
@@ -209,25 +240,12 @@ class YtDlpService {
               totalBytes: size,
             ),
           );
-          return recovered;
+          return out;
+        } catch (e) {
+          lastError = e;
         }
-        throw Exception(result.errorMessage ?? 'yt-dlp gagal unduh potongan');
       }
-      final out = await _findOutput(
-        outputDir,
-        preferred: result.outputPath,
-        videoId: videoId,
-      );
-      final size = await File(out).length();
-      onProgress(
-        YtDownloadProgress(
-          progress01: 1,
-          phase: 'Selesai unduh',
-          downloadedBytes: size,
-          totalBytes: size,
-        ),
-      );
-      return out;
+      throw Exception(lastError ?? 'yt-dlp gagal unduh potongan');
     } finally {
       await subs.cancel();
     }
@@ -639,13 +657,7 @@ class YtDlpService {
     );
     final subs = tracker.bind(_dl);
 
-    final custom = Map<String?, String?>.from(_baseArgs);
-    custom['--concurrent-fragments'] = '4';
-    if (extractAudio && capSec > 0) {
-      custom['--postprocessor-args'] =
-          'ffmpeg:-ac 1 -ar 16000 -b:a 32k -t $capSec';
-    }
-
+    Object? lastError;
     try {
       onProgress(
         YtDownloadProgress(
@@ -654,67 +666,178 @@ class YtDlpService {
           totalBytes: estimated,
         ),
       );
-      final result = await _dl.download(
-        DownloadRequest(
-          url: url,
-          outputPath: outputDir,
-          outputTemplate: '%(id)s_audio.%(ext)s',
-          format: format,
-          extractAudio: extractAudio,
-          audioFormat: extractAudio ? 'mp3' : null,
-          audioQuality: extractAudio ? 9 : null,
-          noPlaylist: true,
-          processId: processId,
-          customOptions: custom,
-        ),
-      );
-      if (result.status != OperationStatus.success) {
+      for (var i = 0; i < playerClients.length; i++) {
+        final custom = Map<String?, String?>.from(_baseArgs);
+        custom['--extractor-args'] = playerClients[i];
+        custom['--concurrent-fragments'] = '4';
+        if (extractAudio && capSec > 0) {
+          custom['--postprocessor-args'] =
+              'ffmpeg:-ac 1 -ar 16000 -b:a 32k -t $capSec';
+        }
         try {
-          final recovered = await _findOutput(
+          final result = await _dl.download(
+            DownloadRequest(
+              url: url,
+              outputPath: outputDir,
+              outputTemplate: '%(id)s_audio.%(ext)s',
+              format: format,
+              extractAudio: extractAudio,
+              audioFormat: extractAudio ? 'mp3' : null,
+              audioQuality: extractAudio ? 9 : null,
+              noPlaylist: true,
+              processId: '${processId}_$i',
+              customOptions: custom,
+            ),
+          );
+          if (result.status != OperationStatus.success) {
+            lastError = result.errorMessage;
+            final recovered = await _tryRecoverOutput(
+              outputDir: outputDir,
+              preferred: result.outputPath,
+              videoId: videoId,
+              audioOnly: true,
+            );
+            if (recovered != null) {
+              return await _finishAudio(
+                recovered,
+                extractAudio: extractAudio,
+                onProgress: onProgress,
+              );
+            }
+            continue;
+          }
+          final out = await _findOutput(
             outputDir,
             preferred: result.outputPath,
             videoId: videoId,
             audioOnly: true,
           );
-          final rs = await File(recovered).length();
-          if (rs > 1024 && rs <= groqMaxUploadBytes) {
-            onProgress(
-              YtDownloadProgress(
-                progress01: 1,
-                phase: 'Audio siap',
-                downloadedBytes: rs,
-                totalBytes: rs,
-              ),
+          return await _finishAudio(
+            out,
+            extractAudio: extractAudio,
+            onProgress: onProgress,
+          );
+        } catch (e) {
+          lastError = e;
+          final recovered = await _tryRecoverOutput(
+            outputDir: outputDir,
+            preferred: null,
+            videoId: videoId,
+            audioOnly: true,
+          );
+          if (recovered != null) {
+            return await _finishAudio(
+              recovered,
+              extractAudio: extractAudio,
+              onProgress: onProgress,
             );
-            return recovered;
           }
-        } catch (_) {}
-        throw Exception(result.errorMessage ?? 'yt-dlp gagal unduh audio');
-      }
-      final out = await _findOutput(
-        outputDir,
-        preferred: result.outputPath,
-        videoId: videoId,
-        audioOnly: true,
-      );
-      final size = await File(out).length();
-      if (extractAudio && size > groqMaxUploadBytes) {
-        throw Exception(
-          'Audio hasil ${(size / (1024 * 1024)).toStringAsFixed(1)} MB '
-          'masih di atas limit Groq ~23 MB. Coba video lebih pendek.',
-        );
+        }
       }
       onProgress(
         YtDownloadProgress(
-          progress01: 1,
-          phase: 'Audio siap',
-          downloadedBytes: size,
-          totalBytes: size,
+          progress01: 0.4,
+          phase: 'Cadangan audio (bukan yt-dlp)...',
         ),
       );
-      return out;
+      try {
+        return await _downloadAudioExplode(
+          videoId: videoId,
+          outputDir: outputDir,
+          capSec: capSec,
+          onProgress: onProgress,
+        );
+      } catch (e) {
+        lastError = e;
+      }
+      throw Exception(
+        lastError ?? 'yt-dlp gagal unduh audio (SABR / page reload)',
+      );
     } finally {
       await subs.cancel();
+    }
+  }
+
+  Future<String> _finishAudio(
+    String path, {
+    required bool extractAudio,
+    required YtProgressCallback onProgress,
+  }) async {
+    final size = await File(path).length();
+    if (extractAudio && size > groqMaxUploadBytes) {
+      throw Exception(
+        'Audio hasil ${(size / (1024 * 1024)).toStringAsFixed(1)} MB '
+        'masih di atas limit Groq ~23 MB. Coba video lebih pendek.',
+      );
+    }
+    onProgress(
+      YtDownloadProgress(
+        progress01: 1,
+        phase: 'Audio siap',
+        downloadedBytes: size,
+        totalBytes: size,
+      ),
+    );
+    return path;
+  }
+
+  Future<String> _downloadAudioExplode({
+    required String videoId,
+    required String outputDir,
+    required int capSec,
+    required YtProgressCallback onProgress,
+  }) async {
+    final yt = YoutubeExplode();
+    try {
+      final manifest = await yt.videos.streamsClient.getManifest(
+        videoId,
+        ytClients: [
+          YoutubeApiClient.androidSdkless,
+          YoutubeApiClient.ios,
+        ],
+      );
+      final audios = manifest.audioOnly.toList()
+        ..sort((a, b) => a.bitrate.compareTo(b.bitrate));
+      final m4a = audios.where((s) {
+        final n = s.container.name.toLowerCase();
+        return n.contains('mp4') || n.contains('m4a');
+      });
+      final audio = m4a.isNotEmpty ? m4a.first : (audios.isEmpty ? null : audios.first);
+      if (audio == null) {
+        throw Exception('Tidak ada stream audio.');
+      }
+      final ext = audio.container.name.toLowerCase().contains('mp4') ||
+              audio.container.name.toLowerCase().contains('m4a')
+          ? 'm4a'
+          : audio.container.name.toLowerCase();
+      final dest = File(p.join(outputDir, '${videoId}_audio.$ext'));
+      if (await dest.exists()) await dest.delete();
+      final sink = dest.openWrite();
+      var got = 0;
+      await for (final chunk in yt.videos.streamsClient.get(audio)) {
+        sink.add(chunk);
+        got += chunk.length;
+        onProgress(
+          YtDownloadProgress(
+            progress01: (0.4 + 0.5 * (got / math.max(got, audio.size.totalBytes)))
+                .clamp(0.4, 0.95),
+            phase: 'Mengunduh audio…',
+            downloadedBytes: got,
+            totalBytes: audio.size.totalBytes,
+          ),
+        );
+      }
+      await sink.close();
+      if (!await dest.exists() || await dest.length() < 2048) {
+        throw Exception('File audio cadangan kosong.');
+      }
+      return await _finishAudio(
+        dest.path,
+        extractAudio: true,
+        onProgress: onProgress,
+      );
+    } finally {
+      yt.close();
     }
   }
 

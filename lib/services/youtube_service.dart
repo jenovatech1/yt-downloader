@@ -510,7 +510,7 @@ class YoutubeService {
   static String shortError(Object e) {
     var s = e.toString().replaceFirst(RegExp(r'^Exception:\s*'), '');
     if (s.contains('403') || s.contains('YoutubeExplodeException')) {
-      return 'YouTube menolak stream (403). Coba kualitas lebih rendah.';
+      return 'YouTube menolak stream (403). Coba lagi. Kalau masih gagal, pilih kualitas lebih rendah.';
     }
     if (s.contains('fatal failure') ||
         s.contains('FatalFailure') ||
