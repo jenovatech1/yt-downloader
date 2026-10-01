@@ -228,7 +228,7 @@ class YtDlpService {
               url: url,
               outputPath: outputDir,
               outputTemplate: '%(id)s_clip.%(ext)s',
-              format: formatForSection(height),
+              format: formatForHeight(height),
               noPlaylist: true,
               processId: attemptId,
               customOptions: custom,
