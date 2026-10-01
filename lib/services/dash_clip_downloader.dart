@@ -93,9 +93,9 @@ class DashClipDownloader {
       if (isVideoOnly && h <= maxHeight) {
         final codec = vcodec.toLowerCase();
         final codecScore = codec.contains('avc') || codec.contains('h264')
-            ? 10000
+            ? 5
             : 0;
-        final score = codecScore + h;
+        final score = h * 100 + codecScore;
         if (score > bestVScore) {
           bestV = m;
           bestVScore = score;

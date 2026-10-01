@@ -3,9 +3,9 @@ import 'dart:convert';
 import 'package:flutter/services.dart';
 
 const _playerClients = <String>[
-  'youtube:player_client=android,ios,tv',
   'youtube:player_client=ios,tv,mweb',
-  'youtube:player_client=tv_embedded,android',
+  'youtube:player_client=tv_embedded,ios',
+  'youtube:player_client=android,ios,tv',
   'youtube:player_client=web,android',
 ];
 

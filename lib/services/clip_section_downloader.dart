@@ -714,10 +714,13 @@ class ClipSectionDownloader {
             .where((s) => !androidOnly || _isAndroidStream(s))
             .toList()
           ..sort((a, b) {
+            final byH = b.videoResolution.height.compareTo(
+              a.videoResolution.height,
+            );
+            if (byH != 0) return byH;
             final aScore = _isAndroidStream(a) ? 2 : 0;
             final bScore = _isAndroidStream(b) ? 2 : 0;
-            if (aScore != bScore) return bScore - aScore;
-            return b.videoResolution.height.compareTo(a.videoResolution.height);
+            return bScore - aScore;
           });
     return candidates.isEmpty ? null : candidates.first;
   }

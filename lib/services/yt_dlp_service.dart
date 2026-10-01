@@ -58,42 +58,43 @@ class YtDlpService {
     } catch (_) {}
   }
 
-  static String formatForHeight(int height) {
-    final h = height.clamp(144, 1080);
-    const a =
-        '(bestaudio[format_note*=original][ext=m4a]/'
-        'bestaudio[format_note*=original]/'
-        'bestaudio[ext=m4a]/bestaudio)';
-    // Prefer H.264 (avc1) biar Klippod/FFprobe bisa baca width/height.
-    // JANGAN fallback ke bare `best` — yt-dlp treat warning itu sebagai gagal.
-    return 'bestvideo[height<=$h][vcodec^=avc1][ext=mp4]+$a/'
-        'bestvideo[height<=$h][vcodec*=avc1]+$a/'
-        'bestvideo[height<=$h][vcodec^=avc]+$a/'
-        'bestvideo[height<=$h][ext=mp4]+$a/'
-        'bestvideo[height<=$h]+$a/'
-        'bestvideo[height<=360]+$a/'
-        'bv*+ba/b';
-  }
+  static const _bestAudio =
+      '(bestaudio[format_note*=original][ext=m4a]/'
+      'bestaudio[format_note*=original]/'
+      'bestaudio[ext=m4a]/bestaudio)';
+
+  /// Exact height dulu. Jangan `bestvideo[height<=1080][vcodec^=avc1]` —
+  /// itu cocok 360p H.264 dan tidak pernah coba 1080 VP9/AV1.
+  static String formatForHeight(int height) =>
+      _formatLadder(height, allowMuxed: true);
 
   /// Section: DASH only (tanpa muxed `b`) biar YouTube tidak throttle ~0.2 Mbps.
-  static String formatForSection(int height) {
+  static String formatForSection(int height) =>
+      _formatLadder(height, allowMuxed: false);
+
+  static String _formatLadder(int height, {required bool allowMuxed}) {
     final h = height.clamp(144, 1080);
-    const a =
-        '(bestaudio[format_note*=original][ext=m4a]/'
-        'bestaudio[format_note*=original]/'
-        'bestaudio[ext=m4a]/bestaudio)';
-    return 'bestvideo[height<=$h][vcodec^=avc1][ext=mp4]+$a/'
-        'bestvideo[height<=$h][vcodec*=avc1]+$a/'
-        'bestvideo[height<=$h][ext=mp4]+$a/'
-        'bestvideo[height<=$h]+$a/'
-        'bv*+ba';
+    const rungs = [1080, 720, 480, 360, 240, 144];
+    final a = _bestAudio;
+    final parts = <String>[];
+    for (final r in rungs) {
+      if (r > h) continue;
+      parts.add('bestvideo[height=$r][vcodec^=avc1][ext=mp4]+$a');
+      parts.add('bestvideo[height=$r][vcodec*=avc1]+$a');
+      parts.add('bestvideo[height=$r][ext=mp4]+$a');
+      parts.add('bestvideo[height=$r]+$a');
+    }
+    parts.add('bestvideo[height<=$h]+$a');
+    parts.add('bv*[height<=$h]+ba');
+    if (allowMuxed) parts.add('b[height<=$h]');
+    return parts.join('/');
   }
 
-  /// SABR / "page needs to be reloaded": coba client non-web dulu.
+  /// iOS/TV dulu — android client sering hanya 360p muxed.
   static const playerClients = <String>[
-    'youtube:player_client=android,ios,tv',
     'youtube:player_client=ios,tv,mweb',
-    'youtube:player_client=tv_embedded,android',
+    'youtube:player_client=tv_embedded,ios',
+    'youtube:player_client=android,ios,tv',
     'youtube:player_client=web,android',
   ];
 
@@ -192,6 +193,7 @@ class YtDlpService {
           sectionEnd: sectionEnd,
         );
         custom['--extractor-args'] = playerClients[i];
+        custom['--format-sort'] = 'res:$height,vcodec:h264,ext:mp4';
         final attemptId = '${processId}_$i';
         try {
           final result = await _dl.download(
@@ -199,7 +201,7 @@ class YtDlpService {
               url: url,
               outputPath: outputDir,
               outputTemplate: '%(id)s_clip.%(ext)s',
-              format: formatForHeight(height),
+              format: formatForSection(height),
               noPlaylist: true,
               processId: attemptId,
               customOptions: custom,
@@ -281,7 +283,6 @@ class YtDlpService {
 
     final processId = 'v_${videoId}_${DateTime.now().millisecondsSinceEpoch}';
     final url = 'https://www.youtube.com/watch?v=$videoId';
-    final custom = Map<String?, String?>.from(_baseArgs);
 
     final tracker = _ProgressTracker(
       processId: processId,
@@ -300,36 +301,53 @@ class YtDlpService {
           totalBytes: estimatedTotalBytes,
         ),
       );
-      final result = await _dl.download(
-        DownloadRequest(
-          url: url,
-          outputPath: outputDir,
-          outputTemplate: '%(id)s_%(height)sp.%(ext)s',
-          format: formatForHeight(height),
-          noPlaylist: true,
-          processId: processId,
-          customOptions: custom,
-        ),
-      );
-      if (result.status != OperationStatus.success) {
-        final recovered = await _tryRecoverOutput(
-          outputDir: outputDir,
-          preferred: result.outputPath,
-          videoId: videoId,
-        );
-        if (recovered != null) {
-          final size = await File(recovered).length();
-          onProgress(
-            YtDownloadProgress(
-              progress01: 1,
-              phase: 'Selesai unduh',
-              downloadedBytes: size,
-              totalBytes: size,
+      Object? lastError;
+      String? bestPath;
+      var bestHeight = -1;
+      for (var i = 0; i < playerClients.length; i++) {
+        final custom = Map<String?, String?>.from(_baseArgs);
+        custom['--extractor-args'] = playerClients[i];
+        custom['--format-sort'] = 'res:$height,vcodec:h264,ext:mp4';
+        try {
+          final result = await _dl.download(
+            DownloadRequest(
+              url: url,
+              outputPath: outputDir,
+              outputTemplate: '%(id)s_%(height)sp.%(ext)s',
+              format: formatForHeight(height),
+              noPlaylist: true,
+              processId: '${processId}_$i',
+              customOptions: custom,
             ),
           );
-          return recovered;
+          String? path;
+          if (result.status == OperationStatus.success) {
+            path = await _findOutput(
+              outputDir,
+              preferred: result.outputPath,
+              videoId: videoId,
+            );
+          } else {
+            lastError = result.errorMessage;
+            path = await _tryRecoverOutput(
+              outputDir: outputDir,
+              preferred: result.outputPath,
+              videoId: videoId,
+            );
+            if (path == null) continue;
+          }
+          final got = _heightFromFilename(path) ?? 0;
+          if (got >= bestHeight) {
+            bestHeight = got;
+            bestPath = path;
+          }
+          if (got >= height) break;
+        } catch (e) {
+          lastError = e;
         }
-        final err = result.errorMessage ?? 'yt-dlp gagal unduh video';
+      }
+      if (bestPath == null) {
+        final err = lastError?.toString() ?? 'yt-dlp gagal unduh video';
         if (_isBenignYtDlpWarning(err)) {
           throw Exception(
             'Unduh gagal setelah peringatan yt-dlp. Coba lagi atau ganti kualitas.',
@@ -337,12 +355,7 @@ class YtDlpService {
         }
         throw Exception(err);
       }
-      final out = await _findOutput(
-        outputDir,
-        preferred: result.outputPath,
-        videoId: videoId,
-      );
-      final size = await File(out).length();
+      final size = await File(bestPath).length();
       onProgress(
         YtDownloadProgress(
           progress01: 1,
@@ -351,7 +364,7 @@ class YtDlpService {
           totalBytes: size,
         ),
       );
-      return out;
+      return bestPath;
     } finally {
       await subs.cancel();
     }
@@ -401,6 +414,7 @@ class YtDlpService {
     custom['--config-location'] = confFile.path;
     custom['--remux-video'] = 'mp4';
     custom['--postprocessor-args'] = 'ffmpeg:-movflags +faststart';
+    custom['--format-sort'] = 'res:$height,vcodec:h264,ext:mp4';
 
     final tracker = _ProgressTracker(
       processId: processId,
@@ -425,7 +439,7 @@ class YtDlpService {
           url: url,
           outputPath: outputDir,
           outputTemplate: '%(id)s_clip_%(autonumber)03d.%(ext)s',
-          format: formatForHeight(height),
+          format: formatForSection(height),
           noPlaylist: true,
           processId: processId,
           customOptions: custom,
@@ -843,6 +857,11 @@ class YtDlpService {
 
   static const _audioExts = {'.m4a', '.mp3', '.opus', '.ogg', '.wav'};
 
+  static int? _heightFromFilename(String path) {
+    final m = RegExp(r'_(\d{3,4})p\.').firstMatch(p.basename(path));
+    return m == null ? null : int.tryParse(m.group(1)!);
+  }
+
   static bool _isBenignYtDlpWarning(String message) {
     final l = message.toLowerCase();
     if (!l.contains('warning')) return false;
@@ -900,9 +919,12 @@ class YtDlpService {
         .where((e) => e is File)
         .cast<File>()
         .toList();
-    files.sort(
-      (a, b) => b.statSync().modified.compareTo(a.statSync().modified),
-    );
+    files.sort((a, b) {
+      final ha = _heightFromFilename(a.path) ?? 0;
+      final hb = _heightFromFilename(b.path) ?? 0;
+      if (ha != hb) return hb.compareTo(ha);
+      return b.statSync().modified.compareTo(a.statSync().modified);
+    });
 
     for (final f in files) {
       final ext = p.extension(f.path).toLowerCase();
