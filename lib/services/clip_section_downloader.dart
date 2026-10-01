@@ -38,6 +38,7 @@ class ClipSectionDownloader {
     try {
       final ytdlpInfo = await _fetchSegmentedInfo(videoId, height);
       _batch!.ytdlpInfo = ytdlpInfo;
+      _batch!.fetchedAt = DateTime.now();
       _batch!.lockedMode = ClipSectionMode.dash;
       onPhase?.call('Segment paralel · cuma potongan hook');
       return ClipSectionMode.dash;
@@ -63,6 +64,7 @@ class ClipSectionDownloader {
         final info = await YtdlpExecChannel.instance.dumpVideoJsonMap(
           videoId: videoId,
           format: fmt,
+          clients: YtDlpService.clipDumpClients,
         );
         if (DashClipDownloader.instance.hasSegmentedStreams(
           info,
@@ -81,6 +83,20 @@ class ClipSectionDownloader {
     );
   }
 
+  Future<void> _refreshBatchInfo({bool force = false}) async {
+    final batch = _batch;
+    if (batch == null) return;
+    final age = DateTime.now().difference(batch.fetchedAt ?? DateTime(2000));
+    if (!force && age.inSeconds < 40 && batch.ytdlpInfo != null) return;
+    try {
+      batch.ytdlpInfo = await _fetchSegmentedInfo(batch.videoId, batch.height);
+      batch.fetchedAt = DateTime.now();
+      batch.lockedMode = ClipSectionMode.dash;
+    } catch (_) {
+      // Biarkan pakai info lama / fallback yt-dlp.
+    }
+  }
+
   void endBatch() => _batch = null;
 
   ClipSectionMode get batchMode => _batch?.lockedMode ?? ClipSectionMode.ytdlp;
@@ -97,27 +113,68 @@ class ClipSectionDownloader {
   }) async {
     final mode = _batch?.lockedMode ?? ClipSectionMode.dash;
 
-    if (mode == ClipSectionMode.dash && _batch?.ytdlpInfo != null) {
-      try {
-        return await _downloadViaDash(
-          sectionStart: sectionStart,
-          sectionEnd: sectionEnd,
-          outputDir: outputDir,
-          onProgress: onProgress,
-          estimatedTotalBytes: estimatedTotalBytes,
-          videoDuration: videoDuration ?? _batch?.videoDuration,
-          info: _batch!.ytdlpInfo!,
-          maxHeight: height,
-        );
-      } catch (_) {
-        onProgress(
-          YtDownloadProgress(
-            progress01: 0.05,
-            phase: 'DASH gagal · coba yt-dlp potongan...',
-            totalBytes: estimatedTotalBytes,
-          ),
-        );
+    if (mode == ClipSectionMode.dash) {
+      Object? lastDash;
+      for (var attempt = 0; attempt < 2; attempt++) {
+        await _refreshBatchInfo(force: attempt > 0);
+        final info = _batch?.ytdlpInfo;
+        if (info == null) break;
+        try {
+          return await _downloadViaDash(
+            sectionStart: sectionStart,
+            sectionEnd: sectionEnd,
+            outputDir: outputDir,
+            onProgress: onProgress,
+            estimatedTotalBytes: estimatedTotalBytes,
+            videoDuration: videoDuration ?? _batch?.videoDuration,
+            info: info,
+            maxHeight: height,
+          );
+        } catch (e) {
+          lastDash = e;
+          final s = e.toString();
+          final is403 = s.contains('403') || s.contains('401');
+          onProgress(
+            YtDownloadProgress(
+              progress01: 0.05,
+              phase: is403
+                  ? 'Stream ditolak · refresh URL...'
+                  : 'DASH gagal · coba lagi...',
+              totalBytes: estimatedTotalBytes,
+            ),
+          );
+          if (!is403 && attempt == 0) {
+            // Bukan expire — tetap coba refresh sekali.
+            continue;
+          }
+        }
       }
+      // Turun kualitas DASH kalau 1080 ditolak.
+      if (height > 720 && lastDash != null) {
+        try {
+          await _refreshBatchInfo(force: true);
+          final info = _batch?.ytdlpInfo;
+          if (info != null) {
+            return await _downloadViaDash(
+              sectionStart: sectionStart,
+              sectionEnd: sectionEnd,
+              outputDir: outputDir,
+              onProgress: onProgress,
+              estimatedTotalBytes: estimatedTotalBytes,
+              videoDuration: videoDuration ?? _batch?.videoDuration,
+              info: info,
+              maxHeight: 720,
+            );
+          }
+        } catch (_) {}
+      }
+      onProgress(
+        YtDownloadProgress(
+          progress01: 0.05,
+          phase: 'DASH gagal · coba yt-dlp potongan...',
+          totalBytes: estimatedTotalBytes,
+        ),
+      );
     }
 
     return YtDlpService.instance.downloadVideoSection(
@@ -192,6 +249,7 @@ class ClipSectionDownloader {
     final streams = DashClipDownloader.instance.pickStreams(
       info,
       maxHeight: maxHeight,
+      preferAvc: true,
     );
     if (streams.video == null) {
       throw StateError('Stream video DASH tidak ada');
@@ -784,6 +842,7 @@ class _BatchState {
   StreamManifest? androidManifest;
   StreamManifest? iosManifest;
   Map<String, dynamic>? ytdlpInfo;
+  DateTime? fetchedAt;
   ClipSectionMode? lockedMode;
 }
 

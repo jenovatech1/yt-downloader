@@ -3,9 +3,10 @@ import 'dart:convert';
 import 'package:flutter/services.dart';
 
 const _playerClients = <String>[
+  // Android dulu untuk DASH fragment Get Clip (URL + UA cocok, jarang 403).
+  'youtube:player_client=android,ios,tv',
   'youtube:player_client=ios,tv,mweb',
   'youtube:player_client=tv_embedded,ios',
-  'youtube:player_client=android,ios,tv',
   'youtube:player_client=web,android',
 ];
 
@@ -38,9 +39,10 @@ class YtdlpExecChannel {
   Future<Map<String, dynamic>> dumpVideoJsonMap({
     required String videoId,
     String? format,
+    List<String>? clients,
   }) async {
     Object? last;
-    for (final client in _playerClients) {
+    for (final client in clients ?? _playerClients) {
       try {
         final raw = await dumpVideoJson(
           videoId: videoId,

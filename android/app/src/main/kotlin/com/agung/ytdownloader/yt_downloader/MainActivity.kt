@@ -96,7 +96,7 @@ class MainActivity : FlutterActivity() {
                                     request.addOption("-f", format)
                                 }
                                 val extractorArgs = call.argument<String>("extractorArgs")
-                                    ?: "youtube:player_client=ios,tv,mweb"
+                                    ?: "youtube:player_client=android,ios,tv"
                                 request.addOption("--extractor-args", extractorArgs)
                                 val response = YoutubeDL.getInstance().execute(request)
                                 val out = response.out.trim()

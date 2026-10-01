@@ -109,11 +109,19 @@ class YtDlpService {
     return parts.join('/');
   }
 
-  /// iOS/TV dulu — android client sering hanya 360p muxed.
+  /// iOS/TV dulu untuk full download HD; android tetap ada untuk fallback.
   static const playerClients = <String>[
     'youtube:player_client=ios,tv,mweb',
     'youtube:player_client=tv_embedded,ios',
     'youtube:player_client=android,ios,tv',
+    'youtube:player_client=web,android',
+  ];
+
+  /// Get Clip DASH dump: android dulu biar fragment + header cocok.
+  static const clipDumpClients = <String>[
+    'youtube:player_client=android,ios,tv',
+    'youtube:player_client=ios,tv,mweb',
+    'youtube:player_client=tv_embedded,ios',
     'youtube:player_client=web,android',
   ];
 
