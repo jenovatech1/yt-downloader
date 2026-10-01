@@ -406,28 +406,36 @@ class ClipPipeline {
         final outDir = p.join(workDir.path, 'clip_$i');
         final clipBase = 0.54 + clipSpan * (i / selected.length);
         final clipFrac = clipSpan / selected.length;
-        final path = await ClipSectionDownloader.instance.download(
-          videoId: video.id.value,
-          height: h,
-          sectionStart: hook.startSec,
-          sectionEnd: hook.endSec,
-          outputDir: outDir,
-          estimatedTotalBytes: est,
-          videoDuration: video.duration,
-          onProgress: (p) {
-            emit(
-              p.phase,
-              clipBase + clipFrac * p.progress01.clamp(0.0, 0.99),
-              downloaded: p.downloadedBytes,
-              total: est,
-              speed: p.speedBytesPerSecond,
-              detail: 'Klip ${i + 1}/${selected.length} (potongan ini) · '
-                  '${FormatUtils.bytes(p.downloadedBytes)} / '
-                  '~${FormatUtils.bytes(est)}',
-            );
-          },
-        );
-        await addClip(i, hook, path);
+        try {
+          final path = await ClipSectionDownloader.instance.download(
+            videoId: video.id.value,
+            height: h,
+            sectionStart: hook.startSec,
+            sectionEnd: hook.endSec,
+            outputDir: outDir,
+            estimatedTotalBytes: est,
+            videoDuration: video.duration,
+            onProgress: (p) {
+              emit(
+                p.phase,
+                clipBase + clipFrac * p.progress01.clamp(0.0, 0.99),
+                downloaded: p.downloadedBytes,
+                total: est,
+                speed: p.speedBytesPerSecond,
+                detail: 'Klip ${i + 1}/${selected.length} (potongan ini) · '
+                    '${FormatUtils.bytes(p.downloadedBytes)} / '
+                    '~${FormatUtils.bytes(est)}',
+              );
+            },
+          );
+          await addClip(i, hook, path);
+        } catch (e) {
+          emit(
+            'Klip ${i + 1}/${selected.length} gagal, lanjut…',
+            clipBase + clipFrac,
+            detail: '$e',
+          );
+        }
       }
     } finally {
       ClipSectionDownloader.instance.endBatch();

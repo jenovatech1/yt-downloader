@@ -35,11 +35,17 @@ class ClipSectionDownloader {
     onPhase?.call('Menyiapkan stream potongan...');
 
     await YtDlpService.instance.ensureReady();
-    final ytdlpInfo = await _fetchSegmentedInfo(videoId, height);
-    _batch!.ytdlpInfo = ytdlpInfo;
-    _batch!.lockedMode = ClipSectionMode.dash;
-    onPhase?.call('Segment paralel · cuma potongan hook');
-    return ClipSectionMode.dash;
+    try {
+      final ytdlpInfo = await _fetchSegmentedInfo(videoId, height);
+      _batch!.ytdlpInfo = ytdlpInfo;
+      _batch!.lockedMode = ClipSectionMode.dash;
+      onPhase?.call('Segment paralel · cuma potongan hook');
+      return ClipSectionMode.dash;
+    } catch (_) {
+      _batch!.lockedMode = ClipSectionMode.ytdlp;
+      onPhase?.call('Unduh potongan (yt-dlp)...');
+      return ClipSectionMode.ytdlp;
+    }
   }
 
   Future<Map<String, dynamic>> _fetchSegmentedInfo(
@@ -92,19 +98,37 @@ class ClipSectionDownloader {
     final mode = _batch?.lockedMode ?? ClipSectionMode.dash;
 
     if (mode == ClipSectionMode.dash && _batch?.ytdlpInfo != null) {
-      return _downloadViaDash(
-        sectionStart: sectionStart,
-        sectionEnd: sectionEnd,
-        outputDir: outputDir,
-        onProgress: onProgress,
-        estimatedTotalBytes: estimatedTotalBytes,
-        videoDuration: videoDuration ?? _batch?.videoDuration,
-        info: _batch!.ytdlpInfo!,
-        maxHeight: height,
-      );
+      try {
+        return await _downloadViaDash(
+          sectionStart: sectionStart,
+          sectionEnd: sectionEnd,
+          outputDir: outputDir,
+          onProgress: onProgress,
+          estimatedTotalBytes: estimatedTotalBytes,
+          videoDuration: videoDuration ?? _batch?.videoDuration,
+          info: _batch!.ytdlpInfo!,
+          maxHeight: height,
+        );
+      } catch (_) {
+        onProgress(
+          YtDownloadProgress(
+            progress01: 0.05,
+            phase: 'DASH gagal · coba yt-dlp potongan...',
+            totalBytes: estimatedTotalBytes,
+          ),
+        );
+      }
     }
 
-    throw StateError('Mode unduh potongan tidak didukung');
+    return YtDlpService.instance.downloadVideoSection(
+      videoId: videoId,
+      height: height,
+      sectionStart: sectionStart,
+      sectionEnd: sectionEnd,
+      outputDir: outputDir,
+      onProgress: onProgress,
+      estimatedTotalBytes: estimatedTotalBytes,
+    );
   }
 
   ClipSectionMode _detectMode(_BatchState batch, int height) {

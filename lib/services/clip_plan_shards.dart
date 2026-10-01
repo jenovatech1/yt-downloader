@@ -147,19 +147,32 @@ List<ClipPlanShard> buildClipPlanShards(
     ...modelChain.where((m) => m != preferred),
   ];
   final pieces = splitTranscriptForTpm(transcript);
+  final capped = _capPieces(pieces, 3);
   final counts = distributeClipCounts(
-    pieces.length,
+    capped.length,
     math.max(1, minClips),
     math.max(minClips, maxClips),
   );
   return [
-    for (var i = 0; i < pieces.length; i++)
+    for (var i = 0; i < capped.length; i++)
       ClipPlanShard(
-        text: pieces[i],
+        text: capped[i],
         model: chain[i % chain.length],
         minClips: counts[i].min,
         maxClips: counts[i].max,
         index: i,
       ),
   ];
+}
+
+List<String> _capPieces(List<String> pieces, int max) {
+  if (pieces.length <= max) return pieces;
+  final out = <String>[];
+  final size = (pieces.length / max).ceil();
+  for (var i = 0; i < pieces.length; i += size) {
+    final end = math.min(i + size, pieces.length);
+    out.add(pieces.sublist(i, end).join('\n'));
+    if (out.length >= max) break;
+  }
+  return out;
 }
