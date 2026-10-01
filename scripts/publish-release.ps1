@@ -36,7 +36,11 @@ $latest = @{
     apk         = $apkName
     url         = $url
 } | ConvertTo-Json
-[System.IO.File]::WriteAllText((Join-Path $Root "latest.json"), $latest)
+[System.IO.File]::WriteAllText(
+    (Join-Path $Root "latest.json"),
+    $latest,
+    [System.Text.UTF8Encoding]::new($false)
+)
 
 $exists = $true
 gh release view $tag 2>$null | Out-Null
