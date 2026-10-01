@@ -95,10 +95,9 @@ class MainActivity : FlutterActivity() {
                                 if (!format.isNullOrBlank()) {
                                     request.addOption("-f", format)
                                 }
-                                request.addOption(
-                                    "--extractor-args",
-                                    "youtube:player_client=default,-android_sdkless",
-                                )
+                                val extractorArgs = call.argument<String>("extractorArgs")
+                                    ?: "youtube:player_client=android,ios,tv"
+                                request.addOption("--extractor-args", extractorArgs)
                                 val response = YoutubeDL.getInstance().execute(request)
                                 val out = response.out.trim()
                                 if (out.isEmpty()) {
@@ -199,6 +198,33 @@ class MainActivity : FlutterActivity() {
                             )
                         } catch (e: Exception) {
                             Log.e(tag, "openClipsInKlippod failed", e)
+                            result.error("open_failed", e.message ?: e.toString(), null)
+                        }
+                    }
+                    "openThreadInKlippod" -> {
+                        val path = call.argument<String>("path")
+                        val packageName = call.argument<String>("packageName")
+                        val title = call.argument<String>("title") ?: "Clip Thread"
+                        val youtubeUrl = call.argument<String>("youtubeUrl")
+                        val transcript = call.argument<String>("transcript")
+                        val threadJson = call.argument<String>("threadJson")
+                        if (path.isNullOrBlank() || packageName.isNullOrBlank()) {
+                            result.error("bad_args", "path/packageName required", null)
+                            return@setMethodCallHandler
+                        }
+                        try {
+                            result.success(
+                                openThreadInKlippod(
+                                    path,
+                                    packageName,
+                                    title,
+                                    youtubeUrl,
+                                    transcript,
+                                    threadJson,
+                                ),
+                            )
+                        } catch (e: Exception) {
+                            Log.e(tag, "openThreadInKlippod failed", e)
                             result.error("open_failed", e.message ?: e.toString(), null)
                         }
                     }
@@ -521,6 +547,64 @@ class MainActivity : FlutterActivity() {
         throw IllegalStateException(
             "Klippod terpasang ($packageName) tapi belum ada intent-filter untuk terima video. " +
                 "Pastikan Klippod sudah support klippod://import / ACTION_SEND video.",
+        )
+    }
+
+    private fun openThreadInKlippod(
+        path: String,
+        packageName: String,
+        title: String,
+        youtubeUrl: String?,
+        transcript: String?,
+        threadJson: String?,
+    ): String {
+        val file = File(path)
+        if (!file.exists()) {
+            throw IllegalStateException("File audio tidak ditemukan: $path")
+        }
+        val authority = "${applicationContext.packageName}.fileprovider"
+        val uri = FileProvider.getUriForFile(this, authority, file)
+        grantUriPermission(packageName, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+        fun Intent.withThreadExtras(): Intent {
+            putExtra("import_kind", "thread")
+            putExtra(Intent.EXTRA_TITLE, title)
+            putExtra("source", "yt_downloader")
+            putExtra(Intent.EXTRA_STREAM, uri)
+            if (!youtubeUrl.isNullOrBlank()) putExtra("youtube_url", youtubeUrl)
+            if (!transcript.isNullOrBlank()) putExtra("transcript", transcript)
+            if (!threadJson.isNullOrBlank()) {
+                putExtra("hooks_json", threadJson)
+                putExtra(Intent.EXTRA_TEXT, threadJson)
+            }
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            setPackage(packageName)
+            return this
+        }
+
+        val deepLink = Intent(Intent.ACTION_VIEW).apply {
+            data = Uri.parse("klippod://import-thread")
+            withThreadExtras()
+        }
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "audio/*"
+            withThreadExtras()
+        }
+        for ((name, intent) in listOf("deep_link_thread" to deepLink, "send_audio" to send)) {
+            try {
+                startActivity(intent)
+                Log.i(tag, "Opened Klippod thread via $name")
+                return name
+            } catch (e: ActivityNotFoundException) {
+                Log.w(tag, "No activity for $name", e)
+            } catch (e: Exception) {
+                Log.w(tag, "Failed $name", e)
+            }
+        }
+        if (!isPackageInstalled(packageName)) return "not_installed"
+        throw IllegalStateException(
+            "Klippod terpasang tapi belum bisa menerima clip thread. Update Klippod dulu.",
         )
     }
 

@@ -75,6 +75,45 @@ class KlippodLauncher {
     }
   }
 
+  Future<KlippodOpenOutcome> openThread({
+    required String audioPath,
+    required String title,
+    required String youtubeUrl,
+    String? transcript,
+    String? threadJson,
+  }) async {
+    try {
+      final installed = await isInstalled();
+      if (!installed) {
+        return const KlippodOpenOutcome(KlippodOpenResult.notInstalled);
+      }
+      final mode = await _channel.invokeMethod<String>(
+        'openThreadInKlippod',
+        {
+          'path': audioPath,
+          'packageName': KlippodConfig.packageName,
+          'title': title,
+          'youtubeUrl': youtubeUrl,
+          if (transcript != null && transcript.isNotEmpty)
+            'transcript': transcript,
+          if (threadJson != null && threadJson.isNotEmpty)
+            'threadJson': threadJson,
+        },
+      );
+      if (mode == 'not_installed') {
+        return const KlippodOpenOutcome(KlippodOpenResult.notInstalled);
+      }
+      return const KlippodOpenOutcome(KlippodOpenResult.opened);
+    } on PlatformException catch (e) {
+      return KlippodOpenOutcome(
+        KlippodOpenResult.failed,
+        message: e.message ?? e.code,
+      );
+    } catch (e) {
+      return KlippodOpenOutcome(KlippodOpenResult.failed, message: '$e');
+    }
+  }
+
   Future<KlippodOpenOutcome> openVideo({
     required String filePath,
     required String title,

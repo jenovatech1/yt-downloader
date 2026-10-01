@@ -3,6 +3,9 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:gal/gal.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
@@ -50,6 +53,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   bool _downloading = false;
   bool _downloadDone = false;
   bool _clipping = false;
+  bool _clippingThread = false;
   bool _openingKlippod = false;
   DownloadProgress _progress = DownloadProgress.idle;
   List<HookClip> _clips = [];
@@ -64,6 +68,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   bool _ownAiApplying = false;
   ClipDownloadHandle? _clipCancel;
   bool _clipDownloading = false;
+  final _savingClipPaths = <String>{};
+  final _savedClipPaths = <String>{};
 
   @override
   void initState() {
@@ -217,6 +223,145 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   bool get _busy => _downloading || _clipping || _downloadManager.isRunning;
 
+  Future<bool> _promptMissingWhisperKey(String feature) async {
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('API key belum diisi'),
+        content: Text(
+          '$feature butuh Groq dan/atau Gemini. Isi dulu di Pengaturan app ini, bukan di Klippod.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Nanti'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Pengaturan'),
+          ),
+        ],
+      ),
+    );
+    if (go == true && mounted) {
+      await Navigator.of(
+        context,
+      ).push(MaterialPageRoute(builder: (_) => const SettingsScreen()));
+    }
+    return false;
+  }
+
+  Future<void> _clipThread() async {
+    if (_busy) return;
+    final hasKey = await ApiKeysService.instance.hasWhisperKey();
+    if (!mounted) return;
+    if (!hasKey) {
+      await _promptMissingWhisperKey('Clip Thread');
+      return;
+    }
+    setState(() {
+      _clipping = true;
+      _clippingThread = true;
+      _progress = const DownloadProgress(
+        phase: 'Mengunduh audio Clip Thread...',
+        progress: 0,
+        downloadedBytes: 0,
+        totalBytes: 0,
+        speedBytesPerSecond: 0,
+        detail: 'Tanpa unduh video · hasil ke Klippod',
+      );
+    });
+    await _releasePlayer();
+    try {
+      final dir = await getTemporaryDirectory();
+      final audioPath = await YtDlpService.instance.downloadAudio(
+        videoId: widget.video.id.value,
+        outputDir: p.join(dir.path, 'thread_${widget.video.id.value}'),
+        videoDuration: widget.video.duration,
+        forTranscribe: true,
+        onProgress: (p) {
+          if (!mounted) return;
+          setState(() {
+            _progress = DownloadProgress(
+              phase: p.phase,
+              progress: (0.08 + 0.40 * p.progress01).clamp(0, 0.48),
+              downloadedBytes: p.downloadedBytes,
+              totalBytes: p.totalBytes,
+              speedBytesPerSecond: p.speedBytesPerSecond,
+              detail: 'Audio saja · Clip Thread',
+            );
+          });
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _progress = DownloadProgress(
+          phase: 'Transkripsi Clip Thread...',
+          progress: 0.55,
+          downloadedBytes: 0,
+          totalBytes: 0,
+          speedBytesPerSecond: 0,
+          detail: 'Whisper di app ini · bukan di Klippod',
+        );
+      });
+      final groq = await ApiKeysService.instance.groqKey();
+      final gemini = await ApiKeysService.instance.geminiKey();
+      final ai = ClipAiService();
+      final transcript = await ai.transcribe(
+        audioFile: File(audioPath),
+        groqKey: groq,
+        geminiKey: gemini,
+      );
+      if (!mounted) return;
+      setState(() {
+        _progress = const DownloadProgress(
+          phase: 'Menulis thread...',
+          progress: 0.78,
+          downloadedBytes: 0,
+          totalBytes: 0,
+          speedBytesPerSecond: 0,
+          detail: 'AI di app ini · hasil ke Klippod',
+        );
+      });
+      final threadJson = await ai.generateThreadJson(
+        transcript: transcript.stampedText,
+        groqKey: groq,
+        geminiKey: gemini,
+        videoTitle: widget.video.title,
+        channelName: widget.video.author,
+        coverUrl:
+            widget.video.thumbnails.maxResUrl.isNotEmpty
+                ? widget.video.thumbnails.maxResUrl
+                : widget.video.thumbnails.highResUrl.isNotEmpty
+                    ? widget.video.thumbnails.highResUrl
+                    : 'https://i.ytimg.com/vi/${widget.video.id.value}/maxresdefault.jpg',
+      );
+      if (!mounted) return;
+      setState(() => _openingKlippod = true);
+      final outcome = await _klippod.openThread(
+        audioPath: audioPath,
+        title: widget.video.title,
+        youtubeUrl: 'https://www.youtube.com/watch?v=${widget.video.id.value}',
+        threadJson: threadJson,
+      );
+      if (!mounted) return;
+      await _handleKlippodOutcome(outcome);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Clip Thread gagal: $e')),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _clipping = false;
+          _clippingThread = false;
+          _openingKlippod = false;
+        });
+      }
+    }
+  }
+
   Future<void> _getClip() async {
     final option = _selected;
     if (option == null || _busy) return;
@@ -226,30 +371,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final needsWhisper = await ApiKeysService.instance.hasWhisperKey();
     if (!mounted) return;
     if (!needsWhisper) {
-      final go = await showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: const Text('API key belum diisi'),
-          content: const Text(
-            'Get Clip butuh Groq dan/atau Gemini untuk Whisper. Isi dulu di Pengaturan.',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Nanti'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Pengaturan'),
-            ),
-          ],
-        ),
-      );
-      if (go == true && mounted) {
-        await Navigator.of(
-          context,
-        ).push(MaterialPageRoute(builder: (_) => const SettingsScreen()));
-      }
+      await _promptMissingWhisperKey('Get Clip');
       return;
     }
 
@@ -477,6 +599,42 @@ class _PlayerScreenState extends State<PlayerScreen> {
           showCloseIcon: true,
         ),
       );
+    }
+  }
+
+  Future<void> _saveClipToGallery(HookClip clip) async {
+    if (_savingClipPaths.contains(clip.filePath)) return;
+    setState(() => _savingClipPaths.add(clip.filePath));
+    try {
+      final hasAccess = await Gal.hasAccess(toAlbum: true);
+      if (!hasAccess) {
+        final granted = await Gal.requestAccess(toAlbum: true);
+        if (!granted) {
+          throw Exception('Izin akses galeri ditolak');
+        }
+      }
+      final file = File(clip.filePath);
+      if (!await file.exists() || await file.length() < 2048) {
+        throw Exception('File klip tidak ditemukan');
+      }
+      await Gal.putVideo(clip.filePath, album: 'YT Downloader');
+      if (!mounted) return;
+      setState(() => _savedClipPaths.add(clip.filePath));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Tersimpan di galeri')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Gagal simpan: $e'),
+          backgroundColor: Theme.of(context).colorScheme.error,
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _savingClipPaths.remove(clip.filePath));
+      }
     }
   }
 
@@ -736,6 +894,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
               tip: _clipDownloading
                   ? 'Unduh per klip (DASH fragment) — bukan video full. '
                         'Angka MB = satu potongan hook saja.'
+                  : _clippingThread
+                  ? 'Audio saja, tanpa video. Thread diproses di Klippod.'
                   : _clipping
                   ? 'Langkah 1–2: audio & AI. Unduhan klip (per potongan) setelah ini.'
                   : null,
@@ -808,7 +968,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       : const Icon(Icons.content_cut_rounded),
                   label: Text(
                     _clipping
-                        ? 'Get Clip...'
+                        ? (_clippingThread ? 'Clip Thread...' : 'Get Clip...')
                         : _selected != null
                         ? 'Get Clip (${_selected!.label})'
                         : 'Get Clip',
@@ -823,6 +983,30 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 ),
               ),
             ],
+          ),
+          const SizedBox(height: 10),
+          OutlinedButton.icon(
+            onPressed: _busy ? null : _clipThread,
+            icon: _clippingThread
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.forum_outlined),
+            label: Text(
+              _clippingThread
+                  ? 'Clip Thread...'
+                  : 'Clip Thread (audio → Klippod)',
+            ),
+            style: OutlinedButton.styleFrom(
+              minimumSize: const Size.fromHeight(48),
+              foregroundColor: AppColors.primary,
+              side: const BorderSide(color: AppColors.primary),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14),
+              ),
+            ),
           ),
           if (_downloadDone && _downloadManager.lastExportedPath != null) ...[
             const SizedBox(height: 12),
@@ -889,7 +1073,41 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     ' – ${FormatUtils.duration(Duration(seconds: clip.endSec.round()))}'
                     '${clip.hookScore != null ? ' · skor ${clip.hookScore!.round()}' : ''}',
                   ),
-                  trailing: const Icon(Icons.play_circle_outline_rounded),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        tooltip: 'Putar',
+                        onPressed: () {
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (_) => ClipPreviewScreen(clip: clip),
+                            ),
+                          );
+                        },
+                        icon: const Icon(Icons.play_circle_outline_rounded),
+                      ),
+                      IconButton(
+                        tooltip: _savedClipPaths.contains(clip.filePath)
+                            ? 'Sudah di galeri'
+                            : 'Simpan ke galeri',
+                        onPressed: _savingClipPaths.contains(clip.filePath)
+                            ? null
+                            : () => _saveClipToGallery(clip),
+                        icon: _savingClipPaths.contains(clip.filePath)
+                            ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : Icon(
+                                _savedClipPaths.contains(clip.filePath)
+                                    ? Icons.download_done_rounded
+                                    : Icons.download_rounded,
+                              ),
+                      ),
+                    ],
+                  ),
                   onTap: () {
                     Navigator.of(context).push(
                       MaterialPageRoute(

@@ -93,6 +93,174 @@ class ClipAiService {
     );
   }
 
+  /// Tulis thread X dari transkrip (hasil dikirim ke Klippod, bukan API key).
+  Future<String> generateThreadJson({
+    required String transcript,
+    required String groqKey,
+    required String geminiKey,
+    String? videoTitle,
+    String? channelName,
+    String? coverUrl,
+  }) async {
+    final trimmed = ClipPlanBudget.trimTranscript(transcript);
+    const system =
+        'Kamu editor konten X/Twitter untuk cuplikan podcast/interview/video panjang. '
+        'Mode thread: viral/cerita. Tugas: dari transkrip, tulis 2 versi teks siap post: '
+        '1) longText — sesuai gaya. 2) shortText — bullet, tiap item baris baru. '
+        'BAHASA OUTPUT: ikuti bahasa sumber. '
+        'GAYA longText: thread X viral, tone santai. Bukan essay ringkas. '
+        'Tiap paragraf = 1 tweet (~1–3 kalimat, ideal <260 karakter). WAJIB \\n\\n antar paragraf. '
+        'SUDUT PANDANG WAJIB: orang ketiga tentang tokoh di video — BUKAN seolah kamu = tokoh itu. '
+        'Pakai nama tokoh / peran. JANGAN first-person. '
+        "Hook contoh BENAR: 'Timothy, content creator finansial, bilang lo bisa… 🧵'. "
+        "Kalau nama tidak jelas, pakai peran ('trader muda', 'host podcast') — jangan mengarang nama. "
+        'Urutan ideal (skip yang tidak ada di sumber): '
+        '1) HOOK siapa orangnya + klaim + 🧵. 2) KONTEKS/ANGKA. 3) PROSES HARIAN. '
+        '4) TOOLS/METODE. 5) CONTOH WIN. 6) TAKTIK/MINDSET. 7) DISCLAIMER bila perlu. 8) TAKEAWAY. '
+        'Jangan buka dengan Ringkasan video ini / Dalam podcast ini. Langsung ke orang + hook. '
+        'Hanya fakta di transkrip. Balas HANYA JSON: '
+        '{"threads":[{"title":"...","startSec":0,"endSec":60,"longText":"...","shortText":"...","sceneSecs":[12,40]}]}';
+    final meta = <String>[];
+    if (videoTitle != null && videoTitle.trim().isNotEmpty) {
+      meta.add('Judul video: ${videoTitle.trim()}');
+    }
+    if (channelName != null && channelName.trim().isNotEmpty) {
+      meta.add('Nama channel YouTube: ${channelName.trim()}');
+    }
+    final metaBlock = meta.isEmpty
+        ? ''
+        : 'METADATA SUMBER (petunjuk — verifikasi dengan transkrip):\n'
+              '${meta.join('\n')}\n'
+              'Wawancara/podcast: tokoh = TAMU, bukan host/channel. '
+              'Solo talking head: tokoh = creator/channel. '
+              'Tulis orang ketiga. Jangan gue/gw/aku sebagai tokoh.\n\n';
+    final user =
+        'Pilih 3–5 momen berbeda yang layak jadi thread X. '
+        'Prioritaskan tokoh+angka+proses, bukan ringkasan generik. '
+        'longText: 8–16 paragraf pendek (1 tweet per paragraf), dipisah \\n\\n.\n\n'
+        '$metaBlock'
+        'Transkrip:\n$trimmed';
+    Object? last;
+
+    Map<String, dynamic> withCover(String packed) {
+      final decoded = jsonDecode(packed);
+      if (decoded is! Map<String, dynamic>) return {'raw': packed};
+      if (coverUrl != null && coverUrl.trim().isNotEmpty) {
+        decoded['coverUrl'] = coverUrl.trim();
+      }
+      return decoded;
+    }
+
+    if (groqKey.isNotEmpty) {
+      for (final model in const ['openai/gpt-oss-20b', 'openai/gpt-oss-120b']) {
+        try {
+          final txt = await _groqChatText(
+            apiKey: groqKey,
+            model: model,
+            system: system,
+            user: user,
+          );
+          final packed = _packThreadJson(txt, provider: 'Groq');
+          if (packed != null) return jsonEncode(withCover(packed));
+        } catch (e) {
+          last = e;
+        }
+      }
+    }
+
+    if (geminiKey.isNotEmpty) {
+      try {
+        final json = await _geminiGenerate(
+          apiKey: geminiKey,
+          parts: [
+            {'text': '$system\n\n$user'},
+          ],
+        );
+        final packed = _packThreadJson(
+          _extractGeminiText(json),
+          provider: 'Gemini',
+        );
+        if (packed != null) return jsonEncode(withCover(packed));
+      } catch (e) {
+        last = e;
+      }
+    }
+
+    throw Exception(
+      last == null
+          ? 'Gagal menulis thread. Coba lagi.'
+          : 'Gagal menulis thread: $last',
+    );
+  }
+
+  Future<String> _groqChatText({
+    required String apiKey,
+    required String model,
+    required String system,
+    required String user,
+  }) async {
+    final body = <String, dynamic>{
+      'model': model,
+      'temperature': 0.35,
+      'max_tokens': 8192,
+      'response_format': {'type': 'json_object'},
+      'messages': [
+        {'role': 'system', 'content': system},
+        {'role': 'user', 'content': user},
+      ],
+    };
+    if (model.contains('gpt-oss')) {
+      body['reasoning_effort'] = 'low';
+    }
+    final response = await _client
+        .post(
+          Uri.parse('https://api.groq.com/openai/v1/chat/completions'),
+          headers: {
+            'Authorization': 'Bearer $apiKey',
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode(body),
+        )
+        .timeout(const Duration(seconds: 90));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('${response.statusCode} ${response.body}');
+    }
+    final json = jsonDecode(response.body) as Map<String, dynamic>;
+    return (json['choices'] as List?)?.first?['message']?['content']
+            as String? ??
+        '';
+  }
+
+  String? _packThreadJson(String raw, {required String provider}) {
+    var s = raw.trim();
+    s = s.replaceAll(RegExp(r'```json', caseSensitive: false), '');
+    s = s.replaceAll('```', '').trim();
+    dynamic decoded;
+    try {
+      decoded = jsonDecode(s);
+    } catch (_) {
+      final start = s.indexOf('{');
+      final end = s.lastIndexOf('}');
+      if (start < 0 || end <= start) return null;
+      try {
+        decoded = jsonDecode(s.substring(start, end + 1));
+      } catch (_) {
+        return null;
+      }
+    }
+    List<dynamic>? threads;
+    if (decoded is Map && decoded['threads'] is List) {
+      threads = decoded['threads'] as List;
+    } else if (decoded is List) {
+      threads = decoded;
+    } else if (decoded is Map &&
+        (decoded['longText'] != null || decoded['shortText'] != null)) {
+      threads = [decoded];
+    }
+    if (threads == null || threads.isEmpty) return null;
+    return jsonEncode({'provider': provider, 'threads': threads});
+  }
+
   static bool _isSizeError(Object e) {
     final s = '$e'.toLowerCase();
     return s.contains('too large') ||
@@ -363,7 +531,7 @@ class ClipAiService {
     final shards = buildClipPlanShards(
       transcript,
       modelChain: _clipModels,
-      minClips: 3,
+      minClips: 4,
       maxClips: GetClipConfig.maxClips,
     );
     if (shards.isEmpty) {
@@ -396,6 +564,25 @@ class ClipAiService {
       }
     }
     merged.sort((a, b) => (b.score ?? 0).compareTo(a.score ?? 0));
+    if (merged.length < 3) {
+      try {
+        final extra = await _requestClipPlanOnce(
+          model: _clipModels.first,
+          excerpt: ClipPlanBudget.trimTranscript(transcript),
+          minClips: 4,
+          maxClips: GetClipConfig.maxClips,
+          apiKey: apiKey,
+          videoDuration: videoDuration,
+          durSec: durSec,
+        );
+        for (final h in extra) {
+          final key =
+              '${h.startSec.toStringAsFixed(1)}-${h.endSec.toStringAsFixed(1)}';
+          if (seen.add(key)) merged.add(h);
+        }
+        merged.sort((a, b) => (b.score ?? 0).compareTo(a.score ?? 0));
+      } catch (_) {}
+    }
     if (merged.isEmpty) {
       throw Exception(
         'Generate clips gagal di semua shard (TPM/format). '
@@ -528,8 +715,9 @@ class ClipAiService {
   }) async {
     final prompt =
         'Pilih hook viral dari video durasi ${videoDuration.inSeconds}s. '
-        'Target ${GetClipConfig.maxClips} klip maks, durasi ${GetClipConfig.durationPrompt}, '
-        'sebar di awal/tengah/akhir.\n\n'
+        'WAJIB ${math.max(4, GetClipConfig.maxClips - 2)}-${GetClipConfig.maxClips} klip '
+        'tersebar awal/tengah/akhir. Jangan hanya 1 klip. '
+        'Durasi ${GetClipConfig.durationPrompt}.\n\n'
         'Balas HANYA JSON: {"clips":[{"start_time":"00:00:05.000",'
         '"end_time":"00:01:10.000","hook_text":"...","score":90}]}\n\n'
         'Transkrip:\n${ClipPlanBudget.trimTranscript(transcript)}';
@@ -653,7 +841,16 @@ class ClipAiService {
       if (start == null || end == null || end <= start) continue;
       var s = start.clamp(0, maxSec).toDouble();
       var e = end.clamp(0, maxSec).toDouble();
-      if (e - s < GetClipConfig.minClipSec) continue;
+      if (e - s < GetClipConfig.minClipSec) {
+        final need = GetClipConfig.minClipSec.toDouble();
+        if (s + need <= maxSec) {
+          e = s + need;
+        } else {
+          s = (maxSec - need).clamp(0, maxSec);
+          e = maxSec;
+        }
+        if (e - s < 45) continue;
+      }
       if (e - s > GetClipConfig.maxClipSec) {
         e = s + GetClipConfig.maxClipSec;
       }

@@ -13,6 +13,9 @@ class KlippodConfig {
   /// Host deep link multi-klip: klippod://import-clips
   static const importClipsHost = 'import-clips';
 
+  /// Host deep link clip-thread (audio saja): klippod://import-thread
+  static const importThreadHost = 'import-thread';
+
   static String get playStoreUrl =>
       'https://play.google.com/store/apps/details?id=$packageName';
 
