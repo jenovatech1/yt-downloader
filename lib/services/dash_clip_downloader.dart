@@ -6,7 +6,7 @@ import 'package:path/path.dart' as p;
 
 import 'yt_dlp_service.dart';
 
-/// Unduh potongan via DASH fragment paralel — sama prinsip yt-dlp full download.
+/// Unduh potongan via DASH fragment paralel ? sama prinsip yt-dlp full download.
 /// JANGAN pakai yt-dlp --download-sections (itu paksa FFmpeg = linear ~0.3 Mbps).
 class DashClipDownloader {
   DashClipDownloader._();
@@ -16,13 +16,9 @@ class DashClipDownloader {
   static const chunkTimeout = Duration(seconds: 45);
   static const maxRetries = 5;
 
-  static const _androidUa =
-      'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip';
-  static const _iosUa =
-      'com.google.ios.youtube/20.10.3 (iPhone16,2; U; CPU iOS 17_4 like Mac OS X)';
-
   static const _defaultHeaders = {
-    'user-agent': _androidUa,
+    'user-agent':
+        'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip',
     'accept': '*/*',
     'cookie': 'CONSENT=YES+cb',
     'referer': 'https://www.youtube.com/',
@@ -32,7 +28,6 @@ class DashClipDownloader {
   ({Map<String, dynamic>? video, Map<String, dynamic>? audio}) pickStreams(
     Map<String, dynamic> info, {
     int maxHeight = 1080,
-    bool preferAvc = true,
   }) {
     final preferredAudioLanguage = _preferredAudioLanguage(info);
     final combined = <dynamic>[];
@@ -44,7 +39,6 @@ class DashClipDownloader {
       combined,
       maxHeight: maxHeight,
       preferredAudioLanguage: preferredAudioLanguage,
-      preferAvc: preferAvc,
     );
   }
 
@@ -57,7 +51,6 @@ class DashClipDownloader {
     Object? raw, {
     required int maxHeight,
     String? preferredAudioLanguage,
-    bool preferAvc = true,
   }) {
     if (raw is! List || raw.isEmpty) {
       return (video: null, audio: null);
@@ -94,11 +87,8 @@ class DashClipDownloader {
       if (isVideoOnly && h <= maxHeight) {
         final codec = vcodec.toLowerCase();
         final isAvc = codec.contains('avc') || codec.contains('h264');
-        if (preferAvc && !isAvc) {
-          // Skip VP9/AV1 dulu — fragment + remux MP4 sering 403 / gagal copy.
-          continue;
-        }
-        final score = h * 100 + (isAvc ? 5 : 0);
+        // AVC jauh di atas VP9/AV1 ? remux lokal butuh H.264.
+        final score = (isAvc ? 1000000 : 0) + h;
         if (score > bestVScore) {
           bestV = m;
           bestVScore = score;
@@ -131,15 +121,6 @@ class DashClipDownloader {
       }
     }
     if (bestV != null && bestA != null) return (video: bestV, audio: bestA);
-    // Fallback: izinkan VP9/AV1 kalau H.264 tidak ada di tinggi ini.
-    if (preferAvc && bestV == null) {
-      return _pickFromList(
-        raw,
-        maxHeight: maxHeight,
-        preferredAudioLanguage: preferredAudioLanguage,
-        preferAvc: false,
-      );
-    }
     return (video: bestV, audio: bestA);
   }
 
@@ -210,32 +191,10 @@ class DashClipDownloader {
 
   Map<String, String> headersFromFormat(Map<String, dynamic>? fmt) {
     final out = Map<String, String>.from(_defaultHeaders);
-    final url = '${fmt?['url'] ?? ''} ${fmt?['fragment_base_url'] ?? ''}'
-        .toLowerCase();
-    final note =
-        '${fmt?['format_note'] ?? ''} ${fmt?['format'] ?? ''} ${fmt?['protocol'] ?? ''}'
-            .toLowerCase();
-    final iosLike = url.contains('c=ios') ||
-        url.contains('c=tvhtml5') ||
-        note.contains('ios') ||
-        note.contains('m3u8') ||
-        note.contains('hls');
-    out['user-agent'] = iosLike ? _iosUa : _androidUa;
-
     final raw = fmt?['http_headers'];
     if (raw is Map) {
       raw.forEach((k, v) {
-        if (k == null || v == null) return;
-        final key = k.toString();
-        // Jangan timpa Referer/Origin kosong; UA dari yt-dlp tetap dipakai.
-        if (key.toLowerCase() == 'user-agent' ||
-            key.toLowerCase() == 'referer' ||
-            key.toLowerCase() == 'origin' ||
-            key.toLowerCase() == 'cookie') {
-          out[key] = v.toString();
-        } else {
-          out[key] = v.toString();
-        }
+        if (k != null && v != null) out[k.toString()] = v.toString();
       });
     }
     out.putIfAbsent('referer', () => 'https://www.youtube.com/');
@@ -597,31 +556,18 @@ class DashClipDownloader {
     Map<String, String> headers,
   ) async {
     Object? last;
-    var forbidden = 0;
     for (var a = 0; a < maxRetries; a++) {
-      if (a > 0) await Future<void>.delayed(Duration(milliseconds: 400 * a));
+      if (a > 0) await Future<void>.delayed(Duration(milliseconds: 350 * a));
       try {
         final res = await client
             .get(uri, headers: headers)
             .timeout(chunkTimeout);
-        if (res.statusCode == 403 || res.statusCode == 401) {
-          forbidden++;
-          last = HttpException('HTTP ${res.statusCode}');
-          // URL / signature biasanya sudah mati — jangan buang waktu 5x.
-          if (forbidden >= 2) break;
-          continue;
-        }
         if (res.statusCode != 200 || res.bodyBytes.isEmpty) {
           throw HttpException('HTTP ${res.statusCode}');
         }
         return res.bodyBytes;
       } catch (e) {
         last = e;
-        final s = e.toString();
-        if (s.contains('403') || s.contains('401')) {
-          forbidden++;
-          if (forbidden >= 2) break;
-        }
       }
     }
     throw StateError('Fragment gagal: $last');

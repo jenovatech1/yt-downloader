@@ -2,44 +2,103 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
+import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
+import 'dash_clip_downloader.dart';
+import 'ytdlp_exec_channel.dart';
 import 'yt_dlp_service.dart';
+import 'yt_stream_downloader.dart';
 
-enum ClipSectionMode { ytdlpFull, ytdlp }
+enum ClipSectionMode { dash, progressive, hls, ytdlp }
 
 typedef ClipBatchPhaseCallback = void Function(String phase);
 
-/// Get Clip potongan: pakai jalur yang sama dengan Download penuh (yt-dlp),
-/// karena Range/DASH/HLS sering 403 sementara unduh full 1080p stabil.
+/// Potongan clip — batch manifest + mode lock + yt-dlp sekali untuk banyak section.
 class ClipSectionDownloader {
   ClipSectionDownloader._();
   static final ClipSectionDownloader instance = ClipSectionDownloader._();
 
   _BatchState? _batch;
 
+  /// Fetch yt-dlp format info sekali untuk stream HLS/DASH tersegmentasi.
   Future<ClipSectionMode> beginBatch({
     required String videoId,
     required int height,
     Duration? videoDuration,
-    int estimatedFullBytes = 0,
     ClipBatchPhaseCallback? onPhase,
   }) async {
     _batch = _BatchState(
       videoId: videoId,
       height: height,
       videoDuration: videoDuration,
-      estimatedFullBytes: estimatedFullBytes,
     );
-    onPhase?.call('Siap unduh potongan (jalur sama Download)...');
+    onPhase?.call('Menyiapkan stream potongan...');
+
     await YtDlpService.instance.ensureReady();
-    _batch!.lockedMode = ClipSectionMode.ytdlpFull;
-    return ClipSectionMode.ytdlpFull;
+    try {
+      final ytdlpInfo = await _fetchSegmentedInfo(videoId, height);
+      _batch!.ytdlpInfo = ytdlpInfo;
+      _batch!.fetchedAt = DateTime.now();
+      _batch!.lockedMode = ClipSectionMode.dash;
+      onPhase?.call('Segment paralel · cuma potongan hook');
+      return ClipSectionMode.dash;
+    } catch (_) {
+      _batch!.lockedMode = ClipSectionMode.ytdlp;
+      onPhase?.call('Unduh potongan (yt-dlp)...');
+      return ClipSectionMode.ytdlp;
+    }
+  }
+
+  Future<Map<String, dynamic>> _fetchSegmentedInfo(
+    String videoId,
+    int height,
+  ) async {
+    // Section H.264 only — jangan ladder full-download (bisa VP9).
+    final tries = <String?>[
+      YtDlpService.formatForSection(height),
+      null,
+    ];
+    Object? last;
+    for (final fmt in tries) {
+      try {
+        final info = await YtdlpExecChannel.instance.dumpVideoJsonMap(
+          videoId: videoId,
+          format: fmt,
+          clients: YtDlpService.clipDumpClients,
+        );
+        if (DashClipDownloader.instance.hasSegmentedStreams(
+          info,
+          maxHeight: height,
+        )) {
+          return info;
+        }
+      } catch (e) {
+        last = e;
+      }
+    }
+    throw Exception(
+      last != null
+          ? 'Stream potongan tidak tersedia ($last).'
+          : 'Stream potongan HLS/DASH tidak tersedia untuk video ini.',
+    );
+  }
+
+  Future<void> _refreshInfo({bool force = false}) async {
+    final batch = _batch;
+    if (batch == null) return;
+    final age = DateTime.now().difference(batch.fetchedAt ?? DateTime(2000));
+    if (!force && age.inSeconds < 50 && batch.ytdlpInfo != null) return;
+    try {
+      batch.ytdlpInfo = await _fetchSegmentedInfo(batch.videoId, batch.height);
+      batch.fetchedAt = DateTime.now();
+      batch.lockedMode = ClipSectionMode.dash;
+    } catch (_) {}
   }
 
   void endBatch() => _batch = null;
 
-  ClipSectionMode get batchMode =>
-      _batch?.lockedMode ?? ClipSectionMode.ytdlpFull;
+
+  ClipSectionMode get batchMode => _batch?.lockedMode ?? ClipSectionMode.ytdlp;
 
   Future<String> download({
     required String videoId,
@@ -51,38 +110,50 @@ class ClipSectionDownloader {
     int estimatedTotalBytes = 0,
     Duration? videoDuration,
   }) async {
-    await Directory(outputDir).create(recursive: true);
-    final batch = _batch;
+    final mode = _batch?.lockedMode ?? ClipSectionMode.dash;
 
-    // Sudah punya file full dari klip sebelumnya → potong lokal.
-    final existing = batch?.fullVideoPath;
-    if (existing != null && await File(existing).exists()) {
-      return _cutFromFull(
-        fullPath: existing,
-        sectionStart: sectionStart,
-        sectionEnd: sectionEnd,
-        outputDir: outputDir,
-        onProgress: onProgress,
-        estimatedTotalBytes: estimatedTotalBytes,
+    if (mode == ClipSectionMode.dash) {
+      for (var attempt = 0; attempt < 2; attempt++) {
+        await _refreshInfo(force: attempt > 0);
+        final info = _batch?.ytdlpInfo;
+        if (info == null) break;
+        try {
+          return await _downloadViaDash(
+            sectionStart: sectionStart,
+            sectionEnd: sectionEnd,
+            outputDir: outputDir,
+            onProgress: onProgress,
+            estimatedTotalBytes: estimatedTotalBytes,
+            videoDuration: videoDuration ?? _batch?.videoDuration,
+            info: info,
+            maxHeight: height,
+          );
+        } catch (e) {
+          final is403 = '$e'.contains('403') || '$e'.contains('401');
+          onProgress(
+            YtDownloadProgress(
+              progress01: 0.05,
+              phase: is403
+                  ? 'Stream expire · refresh URL potongan...'
+                  : 'DASH gagal · coba lagi...',
+              totalBytes: estimatedTotalBytes,
+            ),
+          );
+        }
+      }
+      onProgress(
+        YtDownloadProgress(
+          progress01: 0.05,
+          phase: 'DASH gagal · coba yt-dlp potongan...',
+          totalBytes: estimatedTotalBytes,
+        ),
       );
     }
 
-    // Unduh penuh dulu (jalur yang sama dengan tombol Download — terbukti 1080p),
-    // lalu potong tiap hook lokal. Hindari Range/DASH section yang sering 403.
-    onProgress(
-      YtDownloadProgress(
-        progress01: 0.05,
-        phase: 'Mengunduh video ${height}p penuh (sama seperti Download)...',
-        totalBytes: batch?.estimatedFullBytes ?? estimatedTotalBytes,
-      ),
-    );
-    final fullPath = await _ensureFullVideo(
+
+    return YtDlpService.instance.downloadVideoSection(
       videoId: videoId,
       height: height,
-      onProgress: onProgress,
-    );
-    return _cutFromFull(
-      fullPath: fullPath,
       sectionStart: sectionStart,
       sectionEnd: sectionEnd,
       outputDir: outputDir,
@@ -91,85 +162,643 @@ class ClipSectionDownloader {
     );
   }
 
-  Future<String> _ensureFullVideo({
-    required String videoId,
-    required int height,
-    required YtProgressCallback onProgress,
-  }) async {
-    final batch = _batch;
-    final cached = batch?.fullVideoPath;
-    if (cached != null && await File(cached).exists()) {
-      return cached;
+  ClipSectionMode _detectMode(_BatchState batch, int height) {
+    final info = batch.ytdlpInfo;
+    if (info != null) {
+      final streams = DashClipDownloader.instance.pickStreams(info);
+      final vFrags = streams.video == null
+          ? <dynamic>[]
+          : DashClipDownloader.instance.fragmentsFromFormat(streams.video!);
+      if (vFrags.isNotEmpty) return ClipSectionMode.dash;
     }
-
-    final baseDir = batch == null
-        ? Directory.systemTemp.path
-        : p.dirname(p.dirname(batch.fullDirHint ?? Directory.systemTemp.path));
-    final fullDir = Directory(
-      p.join(
-        batch?.workRoot ?? baseDir,
-        'full_${videoId}_${height}p',
-      ),
-    );
-    await fullDir.create(recursive: true);
-
-    final path = await YtDlpService.instance.downloadVideo(
-      videoId: videoId,
-      height: height,
-      outputDir: fullDir.path,
-      estimatedTotalBytes: batch?.estimatedFullBytes ?? 0,
-      onProgress: (p) {
-        onProgress(
-          YtDownloadProgress(
-            progress01: (0.1 + 0.75 * p.progress01).clamp(0.1, 0.9),
-            phase: p.phase.contains('Selesai')
-                ? 'Video penuh siap · merapikan potongan...'
-                : 'Unduh penuh ${height}p · ${p.phase}',
-            downloadedBytes: p.downloadedBytes,
-            totalBytes: p.totalBytes > 0
-                ? p.totalBytes
-                : (batch?.estimatedFullBytes ?? p.downloadedBytes),
-            speedBytesPerSecond: p.speedBytesPerSecond,
-          ),
-        );
-      },
-    );
-    if (batch != null) {
-      batch.fullVideoPath = path;
+    final android = batch.androidManifest;
+    if (android != null && _hasAndroidProgressive(android, height)) {
+      return ClipSectionMode.progressive;
     }
-    return path;
+    final ios = batch.iosManifest;
+    if (ios != null && _hasHls(ios, height)) {
+      return ClipSectionMode.hls;
+    }
+    return ClipSectionMode.ytdlp;
   }
 
-  Future<String> _cutFromFull({
-    required String fullPath,
+  bool _hasAndroidProgressive(StreamManifest manifest, int height) {
+    if (height <= 360) {
+      for (final m in manifest.muxed) {
+        if (m.videoResolution.height <= height && _isAndroidStream(m)) {
+          return true;
+        }
+      }
+    }
+    for (final v in manifest.videoOnly) {
+      if (v.videoResolution.height <= height && _isAndroidStream(v)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _hasHls(StreamManifest manifest, int height) {
+    for (final s in manifest.hls) {
+      if (s is HlsMuxedStreamInfo && s.videoResolution.height <= height) {
+        return true;
+      }
+      if (s is HlsVideoStreamInfo && s.videoResolution.height <= height) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  Future<String> _downloadViaDash({
     required double sectionStart,
     required double sectionEnd,
     required String outputDir,
     required YtProgressCallback onProgress,
     required int estimatedTotalBytes,
+    Duration? videoDuration,
+    required Map<String, dynamic> info,
+    int maxHeight = 1080,
   }) async {
-    final dur = (sectionEnd - sectionStart).clamp(0.5, 600.0);
+    final streams = DashClipDownloader.instance.pickStreams(
+      info,
+      maxHeight: maxHeight,
+    );
+    if (streams.video == null) {
+      throw StateError('Stream video DASH tidak ada');
+    }
+    final durSec =
+        videoDuration?.inSeconds.toDouble() ??
+        (info['duration'] as num?)?.toDouble() ??
+        (sectionEnd + 60);
+    return DashClipDownloader.instance.downloadSection(
+      videoFmt: streams.video!,
+      audioFmt: streams.audio,
+      sectionStart: sectionStart,
+      sectionEnd: sectionEnd,
+      outputDir: outputDir,
+      videoDurationSec: durSec,
+      onProgress: onProgress,
+      estimatedTotalBytes: estimatedTotalBytes,
+    );
+  }
+
+  Future<String> _downloadViaProgressiveRange({
+    required String videoId,
+    required int height,
+    required double sectionStart,
+    required double sectionEnd,
+    required String outputDir,
+    required YtProgressCallback onProgress,
+    required int estimatedTotalBytes,
+    Duration? videoDuration,
+    StreamManifest? manifest,
+  }) async {
+    await Directory(outputDir).create(recursive: true);
     onProgress(
       YtDownloadProgress(
-        progress01: 0.92,
-        phase: 'Memotong dari video penuh...',
-        downloadedBytes: estimatedTotalBytes,
-        totalBytes: estimatedTotalBytes > 0 ? estimatedTotalBytes : 1,
+        progress01: 0.05,
+        phase: 'Mengunduh potongan (Range)...',
+        totalBytes: estimatedTotalBytes,
       ),
     );
+
+    StreamManifest? m = manifest;
+    if (m == null) {
+      final yt = YoutubeExplode();
+      try {
+        m = await yt.videos.streamsClient.getManifest(
+          videoId,
+          ytClients: [YoutubeApiClient.androidSdkless],
+        );
+      } finally {
+        yt.close();
+      }
+    }
+
+    final durSec =
+        videoDuration?.inSeconds.toDouble() ??
+        _guessDurationSec(m) ??
+        (sectionEnd + 120);
+    if (durSec <= 0) throw StateError('Durasi video tidak diketahui');
+
+    if (height <= 360) {
+      final muxed = _pickMuxed(m, height, androidOnly: true);
+      if (muxed != null && muxed.size.totalBytes > 0) {
+        return _finishMuxed(
+          stream: muxed,
+          outputDir: outputDir,
+          sectionStart: sectionStart,
+          sectionEnd: sectionEnd,
+          durSec: durSec,
+          estimatedTotalBytes: estimatedTotalBytes,
+          onProgress: onProgress,
+          label: 'Range',
+        );
+      }
+    }
+
+    final video = _pickVideo(m, height, androidOnly: true);
+    final audio = _pickAudio(m, androidOnly: true);
+    if (video == null || audio == null) {
+      throw StateError('Progressive ANDROID tidak tersedia');
+    }
+
+    final vPath = p.join(outputDir, 'range_v.raw');
+    final aPath = p.join(outputDir, 'range_a.raw');
+    final vEst = _estimateSectionBytes(
+      video.size.totalBytes,
+      durSec,
+      sectionStart,
+      sectionEnd,
+      estimatedTotalBytes ~/ 2,
+    );
+    final aEst = _estimateSectionBytes(
+      audio.size.totalBytes,
+      durSec,
+      sectionStart,
+      sectionEnd,
+      estimatedTotalBytes ~/ 2,
+    );
+
+    StreamTimeRangeResult? vRange;
+    var vGot = 0;
+    var aGot = 0;
+    var vSpeed = 0.0;
+    var aSpeed = 0.0;
+
+    await Future.wait([
+      () async {
+        vRange = await YtStreamDownloader.downloadStreamTimeRange(
+          video,
+          vPath,
+          rangeStartSec: sectionStart,
+          rangeEndSec: sectionEnd,
+          videoDurationSec: durSec,
+          onBytes: (got, total, speed) {
+            vGot = got;
+            vSpeed = speed;
+            _emitCombined(
+              onProgress,
+              vGot + aGot,
+              vEst + aEst,
+              vSpeed + aSpeed,
+              'Mengunduh potongan (Range)...',
+            );
+          },
+        );
+      }(),
+      () async {
+        await YtStreamDownloader.downloadStreamTimeRange(
+          audio,
+          aPath,
+          rangeStartSec: sectionStart,
+          rangeEndSec: sectionEnd,
+          videoDurationSec: durSec,
+          onBytes: (got, total, speed) {
+            aGot = got;
+            aSpeed = speed;
+            _emitCombined(
+              onProgress,
+              vGot + aGot,
+              vEst + aEst,
+              vSpeed + aSpeed,
+              'Mengunduh potongan (Range)...',
+            );
+          },
+        );
+      }(),
+    ]);
+
+    onProgress(
+      YtDownloadProgress(
+        progress01: 0.78,
+        phase: 'Menggabungkan audio+video...',
+        downloadedBytes: vGot + aGot,
+        totalBytes: vEst + aEst,
+        speedBytesPerSecond: vSpeed + aSpeed,
+      ),
+    );
+
+    final trimStart = (sectionStart - vRange!.fileStartSec).clamp(
+      0.0,
+      sectionEnd,
+    );
     return YtDlpService.instance.remuxLocalClip(
-      videoPath: fullPath,
+      videoPath: vPath,
+      audioPath: aPath,
       outputDir: outputDir,
-      trimStartSec: sectionStart,
-      durationSec: dur,
+      trimStartSec: trimStart,
+      durationSec: sectionEnd - sectionStart,
       onProgress: onProgress,
     );
   }
 
-  /// Dipanggil pipeline agar folder full sejajar workDir klip.
-  void setWorkRoot(String workDirPath) {
-    _batch?.workRoot = workDirPath;
-    _batch?.fullDirHint = workDirPath;
+  Future<String> _finishMuxed({
+    required StreamInfo stream,
+    required String outputDir,
+    required double sectionStart,
+    required double sectionEnd,
+    required double durSec,
+    required int estimatedTotalBytes,
+    required YtProgressCallback onProgress,
+    required String label,
+  }) async {
+    final rawPath = p.join(outputDir, 'range_mux.raw');
+    final est = _estimateSectionBytes(
+      stream.size.totalBytes,
+      durSec,
+      sectionStart,
+      sectionEnd,
+      estimatedTotalBytes,
+    );
+    var lastGot = 0;
+    var lastSpeed = 0.0;
+    final range = await YtStreamDownloader.downloadStreamTimeRange(
+      stream,
+      rawPath,
+      rangeStartSec: sectionStart,
+      rangeEndSec: sectionEnd,
+      videoDurationSec: durSec,
+      onBytes: (got, total, speed) {
+        lastGot = got;
+        lastSpeed = speed;
+        onProgress(
+          YtDownloadProgress(
+            progress01: (0.05 + 0.75 * (got / (total > 0 ? total : est))).clamp(
+              0.05,
+              0.80,
+            ),
+            phase: 'Mengunduh potongan ($label)...',
+            downloadedBytes: got,
+            totalBytes: total > 0 ? total : est,
+            speedBytesPerSecond: speed,
+          ),
+        );
+      },
+    );
+    onProgress(
+      YtDownloadProgress(
+        progress01: 0.82,
+        phase: 'Merapikan potongan...',
+        downloadedBytes: lastGot,
+        totalBytes: est,
+        speedBytesPerSecond: lastSpeed,
+      ),
+    );
+    final trimStart = (sectionStart - range.fileStartSec).clamp(
+      0.0,
+      sectionEnd,
+    );
+    return YtDlpService.instance.remuxLocalClip(
+      videoPath: rawPath,
+      outputDir: outputDir,
+      trimStartSec: trimStart,
+      durationSec: sectionEnd - sectionStart,
+      onProgress: onProgress,
+    );
+  }
+
+  Future<String> _downloadViaHls({
+    required String videoId,
+    required int height,
+    required double sectionStart,
+    required double sectionEnd,
+    required String outputDir,
+    required YtProgressCallback onProgress,
+    required int estimatedTotalBytes,
+    Duration? videoDuration,
+    StreamManifest? manifest,
+  }) async {
+    await Directory(outputDir).create(recursive: true);
+    onProgress(
+      YtDownloadProgress(
+        progress01: 0.05,
+        phase: 'Mengunduh potongan (HLS)...',
+        totalBytes: estimatedTotalBytes,
+      ),
+    );
+
+    StreamManifest? m = manifest;
+    if (m == null) {
+      final yt = YoutubeExplode();
+      try {
+        m = await yt.videos.streamsClient.getManifest(
+          videoId,
+          ytClients: [YoutubeApiClient.ios],
+        );
+      } finally {
+        yt.close();
+      }
+    }
+
+    final durSec =
+        videoDuration?.inSeconds.toDouble() ??
+        _guessDurationSec(m) ??
+        (sectionEnd + 60);
+
+    final muxed = m.hls.whereType<HlsMuxedStreamInfo>().toList()
+      ..sort(
+        (a, b) => b.videoResolution.height.compareTo(a.videoResolution.height),
+      );
+    HlsMuxedStreamInfo? pickMuxed;
+    for (final s in muxed) {
+      if (s.videoResolution.height <= height) {
+        pickMuxed = s;
+        break;
+      }
+    }
+    pickMuxed ??= muxed.isEmpty ? null : muxed.last;
+
+    if (pickMuxed != null) {
+      return _finishHlsMuxed(
+        pickMuxed,
+        outputDir: outputDir,
+        sectionStart: sectionStart,
+        sectionEnd: sectionEnd,
+        durSec: durSec,
+        estimatedTotalBytes: estimatedTotalBytes,
+        onProgress: onProgress,
+      );
+    }
+
+    final videos = m.hls.whereType<HlsVideoStreamInfo>().toList()
+      ..sort(
+        (a, b) => b.videoResolution.height.compareTo(a.videoResolution.height),
+      );
+    HlsVideoStreamInfo? pickVideo;
+    for (final s in videos) {
+      if (s.videoResolution.height <= height) {
+        pickVideo = s;
+        break;
+      }
+    }
+    pickVideo ??= videos.isEmpty ? null : videos.last;
+
+    final audios = m.hls.whereType<HlsAudioStreamInfo>().toList()
+      ..sort((a, b) => b.bitrate.compareTo(a.bitrate));
+    final pickAudio = audios.isEmpty ? null : audios.first;
+
+    if (pickVideo == null || pickAudio == null) {
+      throw StateError('HLS video/audio tidak tersedia');
+    }
+
+    final videoStream = pickVideo;
+    final audioStream = pickAudio;
+    final vPath = p.join(outputDir, 'hls_v.raw');
+    final aPath = p.join(outputDir, 'hls_a.raw');
+    final vEst = _estimateSectionBytes(
+      videoStream.size.totalBytes,
+      durSec,
+      sectionStart,
+      sectionEnd,
+      estimatedTotalBytes ~/ 2,
+    );
+    final aEst = _estimateSectionBytes(
+      audioStream.size.totalBytes,
+      durSec,
+      sectionStart,
+      sectionEnd,
+      estimatedTotalBytes ~/ 2,
+    );
+
+    HlsTimeRangeResult? vRange;
+    var vGot = 0;
+    var aGot = 0;
+    var vSpeed = 0.0;
+    var aSpeed = 0.0;
+
+    await Future.wait([
+      () async {
+        vRange = await YtStreamDownloader.downloadHlsTimeRange(
+          videoStream,
+          vPath,
+          rangeStartSec: sectionStart,
+          rangeEndSec: sectionEnd,
+          onBytes: (got, total, speed) {
+            vGot = got;
+            vSpeed = speed;
+            _emitCombined(
+              onProgress,
+              vGot + aGot,
+              vEst + aEst,
+              vSpeed + aSpeed,
+              'Mengunduh potongan (HLS)...',
+            );
+          },
+        );
+      }(),
+      () async {
+        await YtStreamDownloader.downloadHlsTimeRange(
+          audioStream,
+          aPath,
+          rangeStartSec: sectionStart,
+          rangeEndSec: sectionEnd,
+          onBytes: (got, total, speed) {
+            aGot = got;
+            aSpeed = speed;
+            _emitCombined(
+              onProgress,
+              vGot + aGot,
+              vEst + aEst,
+              vSpeed + aSpeed,
+              'Mengunduh potongan (HLS)...',
+            );
+          },
+        );
+      }(),
+    ]);
+
+    onProgress(
+      YtDownloadProgress(
+        progress01: 0.78,
+        phase: 'Menggabungkan audio+video...',
+        downloadedBytes: vGot + aGot,
+        totalBytes: vEst + aEst,
+        speedBytesPerSecond: vSpeed + aSpeed,
+      ),
+    );
+
+    final trimStart = (sectionStart - vRange!.firstSegmentStartSec).clamp(
+      0.0,
+      sectionEnd,
+    );
+    return YtDlpService.instance.remuxLocalClip(
+      videoPath: vPath,
+      audioPath: aPath,
+      outputDir: outputDir,
+      trimStartSec: trimStart,
+      durationSec: sectionEnd - sectionStart,
+      onProgress: onProgress,
+    );
+  }
+
+  Future<String> _finishHlsMuxed(
+    HlsMuxedStreamInfo pickMuxed, {
+    required String outputDir,
+    required double sectionStart,
+    required double sectionEnd,
+    required double durSec,
+    required int estimatedTotalBytes,
+    required YtProgressCallback onProgress,
+  }) async {
+    final rawPath = p.join(outputDir, 'hls_mux.raw');
+    final est = _estimateSectionBytes(
+      pickMuxed.size.totalBytes,
+      durSec,
+      sectionStart,
+      sectionEnd,
+      estimatedTotalBytes,
+    );
+    var lastGot = 0;
+    var lastSpeed = 0.0;
+    final range = await YtStreamDownloader.downloadHlsTimeRange(
+      pickMuxed,
+      rawPath,
+      rangeStartSec: sectionStart,
+      rangeEndSec: sectionEnd,
+      onBytes: (got, total, speed) {
+        lastGot = got;
+        lastSpeed = speed;
+        onProgress(
+          YtDownloadProgress(
+            progress01: (0.05 + 0.75 * (got / (total > 0 ? total : est))).clamp(
+              0.05,
+              0.80,
+            ),
+            phase: 'Mengunduh potongan (HLS)...',
+            downloadedBytes: got,
+            totalBytes: total > 0 ? total : est,
+            speedBytesPerSecond: speed,
+          ),
+        );
+      },
+    );
+    onProgress(
+      YtDownloadProgress(
+        progress01: 0.82,
+        phase: 'Merapikan potongan...',
+        downloadedBytes: lastGot,
+        totalBytes: est,
+        speedBytesPerSecond: lastSpeed,
+      ),
+    );
+    final trimStart = (sectionStart - range.firstSegmentStartSec).clamp(
+      0.0,
+      sectionEnd,
+    );
+    return YtDlpService.instance.remuxLocalClip(
+      videoPath: rawPath,
+      outputDir: outputDir,
+      trimStartSec: trimStart,
+      durationSec: sectionEnd - sectionStart,
+      onProgress: onProgress,
+    );
+  }
+
+  void _emitCombined(
+    YtProgressCallback onProgress,
+    int got,
+    int total,
+    double speed,
+    String phase,
+  ) {
+    onProgress(
+      YtDownloadProgress(
+        progress01: (0.05 + 0.75 * (got / (total > 0 ? total : 1))).clamp(
+          0.05,
+          0.80,
+        ),
+        phase: phase,
+        downloadedBytes: got,
+        totalBytes: total > 0 ? total : got,
+        speedBytesPerSecond: speed,
+      ),
+    );
+  }
+
+  MuxedStreamInfo? _pickMuxed(
+    StreamManifest manifest,
+    int height, {
+    bool androidOnly = false,
+  }) {
+    final candidates =
+        manifest.muxed
+            .where((s) => s.videoResolution.height <= height)
+            .where((s) => !androidOnly || _isAndroidStream(s))
+            .toList()
+          ..sort(
+            (a, b) =>
+                b.videoResolution.height.compareTo(a.videoResolution.height),
+          );
+    return candidates.isEmpty ? null : candidates.first;
+  }
+
+  VideoOnlyStreamInfo? _pickVideo(
+    StreamManifest manifest,
+    int height, {
+    bool androidOnly = false,
+  }) {
+    final candidates =
+        manifest.videoOnly
+            .where((s) => s.videoResolution.height <= height)
+            .where((s) => !androidOnly || _isAndroidStream(s))
+            .toList()
+          ..sort((a, b) {
+            final byH = b.videoResolution.height.compareTo(
+              a.videoResolution.height,
+            );
+            if (byH != 0) return byH;
+            final aScore = _isAndroidStream(a) ? 2 : 0;
+            final bScore = _isAndroidStream(b) ? 2 : 0;
+            return bScore - aScore;
+          });
+    return candidates.isEmpty ? null : candidates.first;
+  }
+
+  AudioOnlyStreamInfo? _pickAudio(
+    StreamManifest manifest, {
+    bool androidOnly = false,
+  }) {
+    final candidates =
+        manifest.audioOnly
+            .where((s) => !androidOnly || _isAndroidStream(s))
+            .toList()
+          ..sort((a, b) {
+            final aScore = _isAndroidStream(a) ? 2 : 0;
+            final bScore = _isAndroidStream(b) ? 2 : 0;
+            if (aScore != bScore) return bScore - aScore;
+            return b.bitrate.compareTo(a.bitrate);
+          });
+    return candidates.isEmpty ? null : candidates.first;
+  }
+
+  bool _isAndroidStream(StreamInfo s) =>
+      (s.url.queryParameters['c'] ?? '').toUpperCase() == 'ANDROID';
+
+  int _estimateSectionBytes(
+    int fullBytes,
+    double durSec,
+    double start,
+    double end,
+    int fallback,
+  ) {
+    if (fullBytes > 0 && durSec > 0) {
+      return ((fullBytes * (end - start) / durSec) * 1.2).round().clamp(
+        256 * 1024,
+        fullBytes,
+      );
+    }
+    return fallback > 0 ? fallback : 5 * 1024 * 1024;
+  }
+
+  double? _guessDurationSec(StreamManifest manifest) {
+    for (final s in [...manifest.videoOnly, ...manifest.muxed]) {
+      final total = s.size.totalBytes;
+      final br = s.bitrate.bitsPerSecond;
+      if (total > 0 && br > 0) return total / (br / 8);
+    }
+    return null;
   }
 }
 
@@ -178,16 +807,15 @@ class _BatchState {
     required this.videoId,
     required this.height,
     this.videoDuration,
-    this.estimatedFullBytes = 0,
   });
 
   final String videoId;
   final int height;
   final Duration? videoDuration;
-  final int estimatedFullBytes;
-  String? workRoot;
-  String? fullDirHint;
-  String? fullVideoPath;
+  StreamManifest? androidManifest;
+  StreamManifest? iosManifest;
+  Map<String, dynamic>? ytdlpInfo;
+  DateTime? fetchedAt;
   ClipSectionMode? lockedMode;
 }
 

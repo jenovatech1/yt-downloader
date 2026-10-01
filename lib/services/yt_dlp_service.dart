@@ -68,27 +68,17 @@ class YtDlpService {
   static String formatForHeight(int height) =>
       _formatLadder(height, allowMuxed: true);
 
-  /// Section: H.264 dulu di setiap resolusi. VP9/AV1 di akhir —
-  /// mux lokal `-c copy` ke MP4 gagal kalau videonya VP9.
+  /// Get Clip DASH: H.264 saja dengan height<=h (hemat + mux-safe).
+  /// Jangan pakai ladder VP9 — fragment VP9 sering gagal di-copy ke MP4.
   static String formatForSection(int height) {
     final h = height.clamp(144, 1080);
-    const rungs = [1080, 720, 480, 360, 240, 144];
-    final a = _bestAudio;
-    final parts = <String>[];
-    for (final r in rungs) {
-      if (r > h) continue;
-      parts.add('bestvideo[height=$r][vcodec^=avc1][ext=mp4]+$a');
-      parts.add('bestvideo[height=$r][vcodec*=avc1]+$a');
-      parts.add('bestvideo[height=$r][vcodec^=avc]+$a');
-    }
-    parts.add('bestvideo[height<=$h][vcodec^=avc1]+$a');
-    for (final r in rungs) {
-      if (r > h) continue;
-      parts.add('bestvideo[height=$r]+$a');
-    }
-    parts.add('bestvideo[height<=$h]+$a');
-    parts.add('bv*[height<=$h]+ba');
-    return parts.join('/');
+    const a = _bestAudio;
+    return 'bestvideo[height<=$h][vcodec^=avc1][ext=mp4]+$a/'
+        'bestvideo[height<=$h][vcodec*=avc1]+$a/'
+        'bestvideo[height<=$h][vcodec^=avc]+$a/'
+        'bestvideo[height<=$h][ext=mp4]+$a/'
+        'bestvideo[height<=$h]+$a/'
+        'bv*[height<=$h]+ba';
   }
 
   static String _formatLadder(int height, {required bool allowMuxed}) {
@@ -228,7 +218,7 @@ class YtDlpService {
               url: url,
               outputPath: outputDir,
               outputTemplate: '%(id)s_clip.%(ext)s',
-              format: formatForHeight(height),
+              format: formatForSection(height),
               noPlaylist: true,
               processId: attemptId,
               customOptions: custom,

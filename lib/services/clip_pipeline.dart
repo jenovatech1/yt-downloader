@@ -389,7 +389,6 @@ class ClipPipeline {
       videoId: video.id.value,
       height: h,
       videoDuration: video.duration,
-      estimatedFullBytes: fullBytes,
       onPhase: (phase) => emit(
         phase,
         0.54,
@@ -398,7 +397,6 @@ class ClipPipeline {
         detail: '$phase · belum unduh byte klip',
       ),
     );
-    ClipSectionDownloader.instance.setWorkRoot(workDir.path);
 
     Object? lastError;
     try {
