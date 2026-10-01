@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
 import '../services/app_update_service.dart';
+import '../services/clip_channel_alerts.dart';
 import '../services/youtube_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/update_dialog.dart';
@@ -30,6 +31,55 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
     AppUpdateService.instance.check();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _checkChannelAlerts();
+    });
+  }
+
+  Future<void> _checkChannelAlerts() async {
+    try {
+      final result = await ClipChannelAlerts().check();
+      if (!mounted || result.items.isEmpty) return;
+      final first = result.items.first;
+      final title = result.items.length == 1
+          ? 'Video baru di channel kamu'
+          : '${result.items.length} video baru di channel kamu';
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text(title),
+          content: Text(
+            '${first.channelTitle}'
+            '${first.video.title.isEmpty ? '' : ' · ${first.video.title}'}',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () async {
+                await ClipChannelAlerts().dismiss(
+                  [for (final item in result.items) item.video.id],
+                );
+                if (ctx.mounted) Navigator.pop(ctx);
+              },
+              child: const Text('Tutup'),
+            ),
+            FilledButton(
+              onPressed: () {
+                Navigator.pop(ctx);
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => CampaignScreen(
+                      initialChannelId: first.channelId,
+                      openChannelTab: true,
+                    ),
+                  ),
+                );
+              },
+              child: const Text('Buka Channel saya'),
+            ),
+          ],
+        ),
+      );
+    } catch (_) {}
   }
 
   @override

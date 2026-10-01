@@ -91,6 +91,7 @@ class ChannelVideoItem {
     this.durationSec,
     this.thumbnail,
     this.viewCount,
+    this.publishedAt,
   });
 
   final String id;
@@ -100,6 +101,32 @@ class ChannelVideoItem {
   final int? durationSec;
   final String? thumbnail;
   final int? viewCount;
+  /// Epoch ms. Null = tanggal tidak diketahui (anggap baru, seperti desktop).
+  final int? publishedAt;
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'url': url,
+        'title': title,
+        'channel': channel,
+        if (durationSec != null) 'durationSec': durationSec,
+        if (thumbnail != null) 'thumbnail': thumbnail,
+        if (viewCount != null) 'viewCount': viewCount,
+        if (publishedAt != null) 'publishedAt': publishedAt,
+      };
+
+  factory ChannelVideoItem.fromJson(Map<String, dynamic> json) {
+    return ChannelVideoItem(
+      id: json['id'] as String? ?? '',
+      url: json['url'] as String? ?? '',
+      title: json['title'] as String? ?? '',
+      channel: json['channel'] as String? ?? '',
+      durationSec: json['durationSec'] as int?,
+      thumbnail: json['thumbnail'] as String?,
+      viewCount: json['viewCount'] as int?,
+      publishedAt: json['publishedAt'] as int?,
+    );
+  }
 }
 
 String buildCampaignClipBrief(ClipCampaign campaign) {

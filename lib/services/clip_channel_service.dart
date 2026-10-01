@@ -109,6 +109,7 @@ class ClipChannelService {
     final uploads = _yt.channels.getUploads(ChannelId(id));
     final out = <ChannelVideoItem>[];
     await for (final video in uploads) {
+      final published = video.uploadDate ?? video.publishDate;
       out.add(
         ChannelVideoItem(
           id: video.id.value,
@@ -118,6 +119,7 @@ class ClipChannelService {
           durationSec: video.duration?.inSeconds,
           thumbnail: video.thumbnails.mediumResUrl,
           viewCount: null,
+          publishedAt: published?.millisecondsSinceEpoch,
         ),
       );
       if (out.length >= limit) break;

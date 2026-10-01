@@ -3,6 +3,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../models/clip_campaign.dart';
 import '../services/clip_campaign_service.dart';
+import '../services/clip_channel_alerts.dart';
 import '../services/clip_channel_service.dart';
 import '../services/youtube_service.dart';
 import '../theme/app_theme.dart';
@@ -10,7 +11,14 @@ import '../utils/format_utils.dart';
 import 'player_screen.dart';
 
 class CampaignScreen extends StatefulWidget {
-  const CampaignScreen({super.key});
+  const CampaignScreen({
+    super.key,
+    this.initialChannelId,
+    this.openChannelTab = false,
+  });
+
+  final String? initialChannelId;
+  final bool openChannelTab;
 
   @override
   State<CampaignScreen> createState() => _CampaignScreenState();
@@ -37,12 +45,32 @@ class _CampaignScreenState extends State<CampaignScreen>
   String? _error;
   final _channelInputCtrl = TextEditingController();
 
+  final _alerts = ClipChannelAlerts();
+
   @override
   void initState() {
     super.initState();
-    _tabs = TabController(length: 2, vsync: this);
-    _loadCampaigns();
-    _loadChannels();
+    _tabs = TabController(
+      length: 2,
+      vsync: this,
+      initialIndex:
+          widget.openChannelTab || widget.initialChannelId != null ? 1 : 0,
+    );
+    _bootstrap();
+  }
+
+  Future<void> _bootstrap() async {
+    await Future.wait([_loadCampaigns(), _loadChannels()]);
+    final id = widget.initialChannelId;
+    if (id == null || !mounted) return;
+    SavedClipChannel? match;
+    for (final ch in _channels) {
+      if (ch.id == id) {
+        match = ch;
+        break;
+      }
+    }
+    if (match != null) await _pickChannel(match);
   }
 
   @override
@@ -131,6 +159,7 @@ class _CampaignScreenState extends State<CampaignScreen>
     setState(() => _addingChannel = true);
     try {
       final saved = await _channelService.addChannel(input);
+      await _alerts.seedChannel(saved, service: _channelService);
       _channelInputCtrl.clear();
       await _loadChannels();
       if (!mounted) return;
@@ -374,7 +403,13 @@ class _CampaignScreenState extends State<CampaignScreen>
                                       )
                                     : v.channel,
                               ),
-                              onTap: () => _openVideoUrl(v.url),
+                              onTap: () {
+                                _alerts.markClicked(
+                                  [v.id],
+                                  channelId: _selectedChannel?.id,
+                                );
+                                _openVideoUrl(v.url);
+                              },
                             ),
                           );
                         },
@@ -445,7 +480,14 @@ class _CampaignScreenState extends State<CampaignScreen>
                   icon: const Icon(Icons.delete_outline_rounded),
                   onPressed: () async {
                     await _channelService.deleteChannel(ch.id);
+                    await _alerts.removeChannel(ch.id);
                     await _loadChannels();
+                    if (_selectedChannel?.id == ch.id) {
+                      setState(() {
+                        _selectedChannel = null;
+                        _channelVideos = [];
+                      });
+                    }
                   },
                 ),
                 onTap: () => _pickChannel(ch),
