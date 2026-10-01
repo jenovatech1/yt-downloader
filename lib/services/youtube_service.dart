@@ -509,6 +509,13 @@ class YoutubeService {
 
   static String shortError(Object e) {
     var s = e.toString().replaceFirst(RegExp(r'^Exception:\s*'), '');
+    if (s.contains('Tidak ada klip berhasil')) {
+      if (s.contains('403') || s.contains('401')) {
+        return 'Get Clip gagal: YouTube menolak unduhan potongan (403). '
+            'Coba lagi, atau pilih 720p.';
+      }
+      return s.length > 280 ? '${s.substring(0, 280)}…' : s;
+    }
     if (s.contains('403') || s.contains('YoutubeExplodeException')) {
       return 'YouTube menolak stream (403). Coba lagi. Kalau masih gagal, pilih kualitas lebih rendah.';
     }
