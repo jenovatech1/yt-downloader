@@ -28,24 +28,16 @@ class DashClipDownloader {
     int maxHeight = 1080,
   }) {
     final preferredAudioLanguage = _preferredAudioLanguage(info);
-    final fromRequested = _pickFromList(
-      info['requested_formats'],
+    final combined = <dynamic>[];
+    final requested = info['requested_formats'];
+    if (requested is List) combined.addAll(requested);
+    final all = info['formats'];
+    if (all is List) combined.addAll(all);
+    return _pickFromList(
+      combined,
       maxHeight: maxHeight,
       preferredAudioLanguage: preferredAudioLanguage,
     );
-    if (fromRequested.video != null) {
-      return fromRequested;
-    }
-
-    final fromFormats = _pickFromList(
-      info['formats'],
-      maxHeight: maxHeight,
-      preferredAudioLanguage: preferredAudioLanguage,
-    );
-    if (fromFormats.video != null) {
-      return fromFormats;
-    }
-    return (video: null, audio: null);
   }
 
   bool hasSegmentedStreams(Map<String, dynamic> info, {int maxHeight = 1080}) {
@@ -92,10 +84,8 @@ class DashClipDownloader {
 
       if (isVideoOnly && h <= maxHeight) {
         final codec = vcodec.toLowerCase();
-        final codecScore = codec.contains('avc') || codec.contains('h264')
-            ? 5
-            : 0;
-        final score = h * 100 + codecScore;
+        final isAvc = codec.contains('avc') || codec.contains('h264');
+        final score = h * 100 + (isAvc ? 5 : 0);
         if (score > bestVScore) {
           bestV = m;
           bestVScore = score;

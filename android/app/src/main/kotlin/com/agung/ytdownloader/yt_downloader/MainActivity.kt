@@ -299,39 +299,50 @@ class MainActivity : FlutterActivity() {
         } else {
             command.addAll(listOf("-map", "0:v:0", "-map", "0:a?"))
         }
-        command.addAll(
+
+        val muxFlags = listOf(
+            listOf("-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart"),
             listOf(
-                "-c",
-                "copy",
-                "-avoid_negative_ts",
-                "make_zero",
-                "-movflags",
-                "+faststart",
-                output.absolutePath,
+                "-c", "copy", "-bsf:a", "aac_adtstoasc",
+                "-avoid_negative_ts", "make_zero", "-movflags", "+faststart",
+            ),
+            listOf(
+                "-c:v", "copy", "-c:a", "aac",
+                "-avoid_negative_ts", "make_zero", "-movflags", "+faststart",
+            ),
+            listOf(
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-c:a", "aac", "-movflags", "+faststart",
             ),
         )
 
-        val processBuilder = ProcessBuilder(command).redirectErrorStream(true)
         val packagesDir = File(noBackupFilesDir, "youtubedl-android/packages")
         val pythonLibDir = File(packagesDir, "python/usr/lib")
         val ffmpegLibDir = File(packagesDir, "ffmpeg/usr/lib")
         val aria2cLibDir = File(packagesDir, "aria2c/usr/lib")
-        processBuilder.environment()["LD_LIBRARY_PATH"] =
+        val ldPath =
             "${pythonLibDir.absolutePath}:${ffmpegLibDir.absolutePath}:" +
-            "${aria2cLibDir.absolutePath}:${applicationInfo.nativeLibraryDir}"
-        val process = processBuilder.start()
-        val log = process.inputStream.bufferedReader().use { it.readText() }
-        val exitCode = process.waitFor()
-        if (exitCode != 0 || !output.exists() || output.length() < 2048L) {
-            throw IllegalStateException(
-                "FFmpeg gagal ($exitCode): ${log.takeLast(1200)}",
-            )
+                "${aria2cLibDir.absolutePath}:${applicationInfo.nativeLibraryDir}"
+
+        var lastLog = ""
+        var lastCode = -1
+        for (flags in muxFlags) {
+            if (output.exists()) output.delete()
+            val attempt = ArrayList(command)
+            attempt.addAll(flags)
+            attempt.add(output.absolutePath)
+            val processBuilder = ProcessBuilder(attempt).redirectErrorStream(true)
+            processBuilder.environment()["LD_LIBRARY_PATH"] = ldPath
+            val process = processBuilder.start()
+            lastLog = process.inputStream.bufferedReader().use { it.readText() }
+            lastCode = process.waitFor()
+            if (lastCode == 0 && output.exists() && output.length() >= 2048L) {
+                return output.absolutePath
+            }
         }
-        if (audio != null && !log.contains("Audio:", ignoreCase = true)) {
-            output.delete()
-            throw IllegalStateException("FFmpeg tidak menemukan track audio")
-        }
-        return output.absolutePath
+        throw IllegalStateException(
+            "FFmpeg gagal ($lastCode): ${lastLog.takeLast(1200)}",
+        )
     }
 
     private fun savePublicText(fileName: String, content: String): Map<String, String> {

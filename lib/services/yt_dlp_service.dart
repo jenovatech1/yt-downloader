@@ -68,9 +68,28 @@ class YtDlpService {
   static String formatForHeight(int height) =>
       _formatLadder(height, allowMuxed: true);
 
-  /// Section: DASH only (tanpa muxed `b`) biar YouTube tidak throttle ~0.2 Mbps.
-  static String formatForSection(int height) =>
-      _formatLadder(height, allowMuxed: false);
+  /// Section: H.264 dulu di setiap resolusi. VP9/AV1 di akhir —
+  /// mux lokal `-c copy` ke MP4 gagal kalau videonya VP9.
+  static String formatForSection(int height) {
+    final h = height.clamp(144, 1080);
+    const rungs = [1080, 720, 480, 360, 240, 144];
+    final a = _bestAudio;
+    final parts = <String>[];
+    for (final r in rungs) {
+      if (r > h) continue;
+      parts.add('bestvideo[height=$r][vcodec^=avc1][ext=mp4]+$a');
+      parts.add('bestvideo[height=$r][vcodec*=avc1]+$a');
+      parts.add('bestvideo[height=$r][vcodec^=avc]+$a');
+    }
+    parts.add('bestvideo[height<=$h][vcodec^=avc1]+$a');
+    for (final r in rungs) {
+      if (r > h) continue;
+      parts.add('bestvideo[height=$r]+$a');
+    }
+    parts.add('bestvideo[height<=$h]+$a');
+    parts.add('bv*[height<=$h]+ba');
+    return parts.join('/');
+  }
 
   static String _formatLadder(int height, {required bool allowMuxed}) {
     final h = height.clamp(144, 1080);

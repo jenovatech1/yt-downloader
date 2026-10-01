@@ -398,6 +398,7 @@ class ClipPipeline {
       ),
     );
 
+    Object? lastError;
     try {
       for (var i = 0; i < selected.length; i++) {
         if (cancel?.shouldStop == true) break;
@@ -430,6 +431,7 @@ class ClipPipeline {
           );
           await addClip(i, hook, path);
         } catch (e) {
+          lastError = e;
           emit(
             'Klip ${i + 1}/${selected.length} gagal, lanjut…',
             clipBase + clipFrac,
@@ -451,7 +453,11 @@ class ClipPipeline {
           transcript: transcript.forWindows(const []),
         );
       }
-      throw Exception('Tidak ada klip berhasil diunduh.');
+      throw Exception(
+        lastError == null
+            ? 'Tidak ada klip berhasil diunduh.'
+            : 'Tidak ada klip berhasil diunduh: $lastError',
+      );
     }
 
     final slimTranscript = transcript.forWindows([
