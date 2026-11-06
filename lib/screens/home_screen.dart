@@ -6,9 +6,11 @@ import '../services/app_update_service.dart';
 import '../services/clip_channel_alerts.dart';
 import '../services/youtube_service.dart';
 import '../theme/app_theme.dart';
+import '../utils/drive_link.dart';
 import '../widgets/update_dialog.dart';
 import '../widgets/video_tile.dart';
 import 'campaign_screen.dart';
+import 'drive_download_screen.dart';
 import 'player_screen.dart';
 import 'settings_screen.dart';
 
@@ -94,6 +96,27 @@ class _HomeScreenState extends State<HomeScreen> {
     if (query.isEmpty) return;
 
     FocusScope.of(context).unfocus();
+
+    if (looksLikeDriveUrl(query)) {
+      if (driveFileId(query) == null) {
+        setState(() {
+          _error =
+              'Link Google Drive tidak valid. Tempel link satu file video '
+              '(file/d/ID atau open?id=ID).';
+          _results = [];
+          _loading = false;
+        });
+        return;
+      }
+      if (!mounted) return;
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => DriveDownloadScreen(url: query),
+        ),
+      );
+      return;
+    }
+
     setState(() {
       _loading = true;
       _error = null;
@@ -185,7 +208,7 @@ class _HomeScreenState extends State<HomeScreen> {
                               ),
                             ),
                             Text(
-                              'Cari judul atau tempel link YouTube',
+                              'YouTube · atau tempel link Google Drive',
                               style: theme.textTheme.bodyMedium?.copyWith(
                                 color: theme.colorScheme.onSurfaceVariant,
                               ),
@@ -256,7 +279,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           textInputAction: TextInputAction.search,
                           onSubmitted: (_) => _search(),
                           decoration: InputDecoration(
-                            hintText: 'Kata kunci atau link...',
+                            hintText: 'YouTube / Drive link / kata kunci…',
                             prefixIcon: const Icon(Icons.search),
                             filled: true,
                             fillColor: Colors.white,

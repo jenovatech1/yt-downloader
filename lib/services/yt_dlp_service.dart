@@ -48,13 +48,18 @@ class YtDlpService {
       _initFuture = null;
       throw Exception(init.errorMessage ?? 'Gagal init yt-dlp');
     }
+    // Update wajib — binary lama: "YouTube is no longer supported" / no visionos.
+    await _tryUpdate();
     _ready = true;
-    unawaited(_tryUpdate());
   }
 
   Future<void> _tryUpdate() async {
     try {
       await _dl.updateYoutubeDL(channel: UpdateChannel.stable);
+    } catch (_) {}
+    try {
+      // Coba sekali lagi lewat channel native (kadang plugin update no-op).
+      await YtdlpExecChannel.instance.forceUpdate();
     } catch (_) {}
   }
 
@@ -68,60 +73,74 @@ class YtDlpService {
   static String formatForHeight(int height) =>
       _formatLadder(height, allowMuxed: true);
 
-  /// Get Clip DASH: H.264 saja dengan height<=h (hemat + mux-safe).
-  /// Jangan pakai ladder VP9 — fragment VP9 sering gagal di-copy ke MP4.
+  /// Get Clip: ladder sama full download, floor resolusi biar tidak ke 360p.
   static String formatForSection(int height) {
-    final h = height.clamp(144, 1080);
-    const a = _bestAudio;
-    return 'bestvideo[height<=$h][vcodec^=avc1][ext=mp4]+$a/'
-        'bestvideo[height<=$h][vcodec*=avc1]+$a/'
-        'bestvideo[height<=$h][vcodec^=avc]+$a/'
-        'bestvideo[height<=$h][ext=mp4]+$a/'
-        'bestvideo[height<=$h]+$a/'
-        'bv*[height<=$h]+ba';
+    final h = height.clamp(360, 1080);
+    final minH = sectionMinHeight(height);
+    return _formatLadder(h, minHeight: minH, allowMuxed: true);
   }
 
-  static String _formatLadder(int height, {required bool allowMuxed}) {
+  static int sectionMinHeight(int height) {
+    final h = height.clamp(360, 1080);
+    return h >= 1080 ? 720 : (h >= 720 ? 480 : h);
+  }
+
+  static String _formatLadder(
+    int height, {
+    int? minHeight,
+    required bool allowMuxed,
+  }) {
     final h = height.clamp(144, 1080);
+    final minH = (minHeight ?? 144).clamp(144, h);
     const rungs = [1080, 720, 480, 360, 240, 144];
     final a = _bestAudio;
     final parts = <String>[];
     for (final r in rungs) {
-      if (r > h) continue;
+      if (r > h || r < minH) continue;
       parts.add('bestvideo[height=$r][vcodec^=avc1][ext=mp4]+$a');
       parts.add('bestvideo[height=$r][vcodec*=avc1]+$a');
       parts.add('bestvideo[height=$r][ext=mp4]+$a');
       parts.add('bestvideo[height=$r]+$a');
     }
-    parts.add('bestvideo[height<=$h]+$a');
-    parts.add('bv*[height<=$h]+ba');
-    if (allowMuxed) parts.add('b[height<=$h]');
+    parts.add('bv*[height>=$minH][height<=$h]+ba');
+    if (allowMuxed) {
+      parts.add('bestvideo[height>=$minH][height<=$h]+$a');
+      parts.add('b[height>=$minH][height<=$h]');
+    }
     return parts.join('/');
   }
 
-  /// iOS/TV dulu untuk full download HD; android tetap ada untuk fallback.
-  static const playerClients = <String>[
-    'youtube:player_client=ios,tv,mweb',
-    'youtube:player_client=tv_embedded,ios',
-    'youtube:player_client=android,ios,tv',
-    'youtube:player_client=web,android',
+  /// null = biarkan yt-dlp pilih client default (tes lokal: 1080p).
+  /// JANGAN paksa visionos — binary HP sering belum support.
+  /// JANGAN utamakan android — cuma format 18 (640x360).
+  static const playerClients = <String?>[
+    null,
+    'youtube:player_client=web_embedded,android',
   ];
 
-  /// Get Clip DASH dump: android dulu biar fragment + header cocok.
-  static const clipDumpClients = <String>[
-    'youtube:player_client=android,ios,tv',
-    'youtube:player_client=ios,tv,mweb',
-    'youtube:player_client=tv_embedded,ios',
-    'youtube:player_client=web,android',
+  static const clipDumpClients = <String?>[
+    null,
+    'youtube:player_client=web_embedded,android',
+  ];
+
+  static const clipSectionClients = <String?>[
+    null, // default saja — web_embedded/android = 360p
   ];
 
   Map<String?, String?> get _baseArgs => {
-    '--extractor-args': playerClients.first,
     '--merge-output-format': 'mp4',
     '--retries': '15',
     '--fragment-retries': '15',
     '--concurrent-fragments': '16',
   };
+
+  void _applyPlayerClient(Map<String?, String?> custom, String? client) {
+    if (client == null || client.isEmpty) {
+      custom.remove('--extractor-args');
+    } else {
+      custom['--extractor-args'] = client;
+    }
+  }
 
   /// Estimasi byte satu potongan dari ukuran video full (bukan tebak 500KB/s).
   static int estimateSectionBytes({
@@ -145,9 +164,11 @@ class YtDlpService {
     required double sectionEnd,
   }) {
     final custom = Map<String?, String?>.from(_baseArgs);
+    // Hemat: yt-dlp cuma ambil fragment di rentang ini (bukan full video).
     custom['--download-sections'] =
         '*${sectionStart.toStringAsFixed(3)}-${sectionEnd.toStringAsFixed(3)}';
     custom['--remux-video'] = 'mp4';
+    custom['--concurrent-fragments'] = '16';
     custom['--postprocessor-args'] = 'ffmpeg:-movflags +faststart';
     return custom;
   }
@@ -168,8 +189,7 @@ class YtDlpService {
     return f;
   }
 
-  /// Potongan via yt-dlp --download-sections (FFmpeg linear, LAMBAT).
-  /// Get Clip pakai [ClipSectionDownloader] + DASH fragment, bukan ini.
+  /// Potongan hemat via yt-dlp --download-sections (fragment di rentang hook).
   Future<String> downloadVideoSection({
     required String videoId,
     required int height,
@@ -187,7 +207,7 @@ class YtDlpService {
     final url = 'https://www.youtube.com/watch?v=$videoId';
     final tracker = _ProgressTracker(
       processId: processId,
-      phaseLabel: 'Mengunduh potongan (yt-dlp)...',
+      phaseLabel: 'Mengunduh potongan...',
       estimatedTotalBytes: estimatedTotalBytes,
       onProgress: onProgress,
       lockSlimEstimate: estimatedTotalBytes > 0,
@@ -199,57 +219,58 @@ class YtDlpService {
       onProgress(
         YtDownloadProgress(
           progress01: 0.02,
-          phase: 'Mengunduh potongan (yt-dlp)...',
+          phase: 'Mengunduh potongan...',
           totalBytes: estimatedTotalBytes,
         ),
       );
       Object? lastError;
-      for (var i = 0; i < playerClients.length; i++) {
+      final minH = sectionMinHeight(height);
+      final clientTries = clipSectionClients;
+      for (var i = 0; i < clientTries.length; i++) {
         final custom = _sectionEngineArgs(
           sectionStart: sectionStart,
           sectionEnd: sectionEnd,
         );
-        custom['--extractor-args'] = playerClients[i];
-        custom['--format-sort'] = 'res:$height,vcodec:h264,ext:mp4';
+        _applyPlayerClient(custom, clientTries[i]);
+        custom['--format-sort'] = 'res:$height,br,ext:mp4:m4a';
         final attemptId = '${processId}_$i';
         try {
           final result = await _dl.download(
             DownloadRequest(
               url: url,
               outputPath: outputDir,
-              outputTemplate: '%(id)s_clip.%(ext)s',
+              outputTemplate: '%(id)s_clip_%(height)sp.%(ext)s',
               format: formatForSection(height),
               noPlaylist: true,
               processId: attemptId,
               customOptions: custom,
             ),
           );
-          if (result.status != OperationStatus.success) {
+          String? out;
+          if (result.status == OperationStatus.success) {
+            out = await _findOutput(
+              outputDir,
+              preferred: result.outputPath,
+              videoId: videoId,
+            );
+          } else {
             lastError = result.errorMessage;
-            final recovered = await _tryRecoverOutput(
+            out = await _tryRecoverOutput(
               outputDir: outputDir,
               preferred: result.outputPath,
               videoId: videoId,
             );
-            if (recovered != null) {
-              final size = await File(recovered).length();
-              onProgress(
-                YtDownloadProgress(
-                  progress01: 1,
-                  phase: 'Selesai unduh',
-                  downloadedBytes: size,
-                  totalBytes: size,
-                ),
-              );
-              return recovered;
-            }
+          }
+          if (out == null) continue;
+          final got = _heightFromFilename(out);
+          if (got != null && got < minH) {
+            lastError =
+                'Potongan cuma ${got}p (butuh >=${minH}p). Engine HP tidak kasih stream HD.';
+            try {
+              await File(out).delete();
+            } catch (_) {}
             continue;
           }
-          final out = await _findOutput(
-            outputDir,
-            preferred: result.outputPath,
-            videoId: videoId,
-          );
           final size = await File(out).length();
           onProgress(
             YtDownloadProgress(
@@ -264,7 +285,78 @@ class YtDlpService {
           lastError = e;
         }
       }
-      throw Exception(lastError ?? 'yt-dlp gagal unduh potongan');
+      throw Exception(lastError ?? 'yt-dlp gagal unduh potongan HD');
+    } finally {
+      await subs.cancel();
+    }
+  }
+
+  /// Unduh URL generik (Google Drive, dll) — format best video.
+  Future<String> downloadUrl({
+    required String url,
+    required String outputDir,
+    required YtProgressCallback onProgress,
+    String? preferredId,
+  }) async {
+    await ensureReady();
+    await Directory(outputDir).create(recursive: true);
+    final idHint = preferredId ??
+        'url_${DateTime.now().millisecondsSinceEpoch}';
+    final processId = 'u_$idHint';
+    final tracker = _ProgressTracker(
+      processId: processId,
+      phaseLabel: 'Mengunduh…',
+      estimatedTotalBytes: 0,
+      onProgress: onProgress,
+      watchDir: outputDir,
+    );
+    final subs = tracker.bind(_dl);
+    try {
+      onProgress(
+        const YtDownloadProgress(
+          progress01: 0.02,
+          phase: 'Menyiapkan yt-dlp…',
+        ),
+      );
+      final custom = Map<String?, String?>.from(_baseArgs);
+      final result = await _dl.download(
+        DownloadRequest(
+          url: url,
+          outputPath: outputDir,
+          outputTemplate: '%(id)s.%(ext)s',
+          format: 'bv*+ba/b',
+          noPlaylist: true,
+          processId: processId,
+          customOptions: custom,
+        ),
+      );
+      String? path;
+      if (result.status == OperationStatus.success) {
+        path = await _findOutput(
+          outputDir,
+          preferred: result.outputPath,
+          videoId: idHint,
+        );
+      } else {
+        path = await _tryRecoverOutput(
+          outputDir: outputDir,
+          preferred: result.outputPath,
+          videoId: idHint,
+        );
+      }
+      if (path == null) {
+        throw Exception(result.errorMessage ?? 'yt-dlp gagal unduh URL');
+      }
+      final size = await File(path).length();
+      onProgress(
+        YtDownloadProgress(
+          progress01: 1,
+          phase: 'Selesai unduh',
+          downloadedBytes: size,
+          totalBytes: size,
+        ),
+      );
+      return path;
     } finally {
       await subs.cancel();
     }
@@ -323,8 +415,8 @@ class YtDlpService {
       var bestHeight = -1;
       for (var i = 0; i < playerClients.length; i++) {
         final custom = Map<String?, String?>.from(_baseArgs);
-        custom['--extractor-args'] = playerClients[i];
-        custom['--format-sort'] = 'res:$height,vcodec:h264,ext:mp4';
+        _applyPlayerClient(custom, playerClients[i]);
+        custom['--format-sort'] = 'res:$height,br,ext:mp4:m4a';
         try {
           final result = await _dl.download(
             DownloadRequest(
@@ -431,7 +523,7 @@ class YtDlpService {
     custom['--config-location'] = confFile.path;
     custom['--remux-video'] = 'mp4';
     custom['--postprocessor-args'] = 'ffmpeg:-movflags +faststart';
-    custom['--format-sort'] = 'res:$height,vcodec:h264,ext:mp4';
+    custom['--format-sort'] = 'res:$height,br,ext:mp4:m4a';
 
     final tracker = _ProgressTracker(
       processId: processId,
@@ -699,7 +791,7 @@ class YtDlpService {
       );
       for (var i = 0; i < playerClients.length; i++) {
         final custom = Map<String?, String?>.from(_baseArgs);
-        custom['--extractor-args'] = playerClients[i];
+        _applyPlayerClient(custom, playerClients[i]);
         custom['--concurrent-fragments'] = '4';
         if (extractAudio && capSec > 0) {
           custom['--postprocessor-args'] =

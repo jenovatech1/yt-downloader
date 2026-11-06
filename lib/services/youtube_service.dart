@@ -19,7 +19,9 @@ class YoutubeService {
     final value = trimmed.toLowerCase();
     if (value.contains('youtube.com') ||
         value.contains('youtu.be') ||
-        value.contains('music.youtube.com')) {
+        value.contains('music.youtube.com') ||
+        value.contains('drive.google.com') ||
+        value.contains('docs.google.com')) {
       return true;
     }
     return RegExp(r'^[a-zA-Z0-9_-]{11}$').hasMatch(trimmed);
@@ -37,9 +39,11 @@ class YoutubeService {
     final trimmed = query.trim();
     if (trimmed.isEmpty) return [];
 
+    // Paste link / video ID: JANGAN _yt.videos.get — sering RequestLimitExceeded.
+    // Pakai oembed/Innertube (sama stabilnya kayak search kata kunci).
     final videoId = tryParseVideoId(trimmed);
     if (videoId != null) {
-      final video = await _yt.videos.get(videoId);
+      final video = await getVideo(videoId);
       return [video];
     }
 
@@ -203,8 +207,122 @@ class YoutubeService {
     return null;
   }
 
-  Future<Video> getVideo(String idOrUrl) {
-    return _yt.videos.get(idOrUrl);
+  Future<Video> getVideo(String idOrUrl) async {
+    final id = tryParseVideoId(idOrUrl) ?? idOrUrl.trim();
+    if (id.isEmpty) throw Exception('Video ID kosong');
+
+    try {
+      return await _getVideoOembed(id);
+    } catch (_) {}
+
+    try {
+      return await _getVideoInnertube(id);
+    } catch (_) {}
+
+    // Terakhir: youtube_explode (bisa kena rate limit).
+    return _yt.videos.get(id);
+  }
+
+  Future<Video> _getVideoOembed(String videoId) async {
+    final uri = Uri.parse(
+      'https://www.youtube.com/oembed'
+      '?format=json&url=${Uri.encodeComponent('https://www.youtube.com/watch?v=$videoId')}',
+    );
+    final response = await _http
+        .get(
+          uri,
+          headers: {
+            'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Accept': 'application/json',
+          },
+        )
+        .timeout(const Duration(seconds: 15));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('oembed ${response.statusCode}');
+    }
+    final root = jsonDecode(response.body);
+    if (root is! Map) throw Exception('oembed invalid');
+    final title = root['title']?.toString().trim();
+    final author = root['author_name']?.toString().trim();
+    if (title == null || title.isEmpty) throw Exception('oembed tanpa title');
+    return Video(
+      VideoId(videoId),
+      title,
+      (author == null || author.isEmpty) ? 'YouTube' : author,
+      ChannelId(_placeholderChannel),
+      null,
+      null,
+      null,
+      '',
+      null,
+      ThumbnailSet(videoId),
+      const [],
+      const Engagement(0, null, null),
+      false,
+    );
+  }
+
+  Future<Video> _getVideoInnertube(String videoId) async {
+    final uri = Uri.parse(
+      'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
+    );
+    final response = await _http
+        .post(
+          uri,
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+          },
+          body: jsonEncode({
+            'context': {
+              'client': {
+                'clientName': 'WEB',
+                'clientVersion': '2.20250312.04.00',
+                'hl': 'en',
+                'gl': 'US',
+              },
+            },
+            'videoId': videoId,
+            'contentCheckOk': true,
+            'racyCheckOk': true,
+          }),
+        )
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Innertube player ${response.statusCode}');
+    }
+    final root = jsonDecode(response.body);
+    if (root is! Map) throw Exception('Innertube player invalid');
+    final details = root['videoDetails'];
+    if (details is! Map) throw Exception('videoDetails kosong');
+    final title = details['title']?.toString().trim();
+    if (title == null || title.isEmpty) throw Exception('title kosong');
+    final author = details['author']?.toString().trim() ?? 'YouTube';
+    final channelId = details['channelId']?.toString();
+    final ch = (channelId != null && ChannelId.validateChannelId(channelId))
+        ? channelId
+        : _placeholderChannel;
+    final secs = int.tryParse(details['lengthSeconds']?.toString() ?? '');
+    final views = int.tryParse(details['viewCount']?.toString() ?? '');
+    final desc = details['shortDescription']?.toString() ?? '';
+    return Video(
+      VideoId(videoId),
+      title,
+      author,
+      ChannelId(ch),
+      null,
+      null,
+      null,
+      desc,
+      secs == null ? null : Duration(seconds: secs),
+      ThumbnailSet(videoId),
+      const [],
+      Engagement(views ?? 0, null, null),
+      details['isLiveContent'] == true,
+    );
   }
 
   YoutubeExplode get client => _yt;
@@ -515,6 +633,12 @@ class YoutubeService {
             'Coba lagi, atau pilih 720p.';
       }
       return s.length > 280 ? '${s.substring(0, 280)}…' : s;
+    }
+    if (s.contains('RequestLimitExceeded') ||
+        s.contains('rate limit') ||
+        s.contains('Rate limit') ||
+        s.contains('late limit')) {
+      return 'YouTube membatasi request. Coba lagi sebentar, atau cari pakai kata kunci.';
     }
     if (s.contains('403') || s.contains('YoutubeExplodeException')) {
       return 'YouTube menolak stream (403). Coba lagi. Kalau masih gagal, pilih kualitas lebih rendah.';
