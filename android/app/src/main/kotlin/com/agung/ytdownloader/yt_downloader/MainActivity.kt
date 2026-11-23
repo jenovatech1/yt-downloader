@@ -1,4 +1,4 @@
-package com.agung.ytdownloader.yt_downloader
+﻿package com.agung.ytdownloader.yt_downloader
 
 import android.content.ActivityNotFoundException
 import android.content.ClipData
@@ -182,6 +182,7 @@ class MainActivity : FlutterActivity() {
                         val title = call.argument<String>("title") ?: "Klip YouTube"
                         val youtubeUrl = call.argument<String>("youtubeUrl")
                         val hooksJson = call.argument<String>("hooksJson")
+                        val channelName = call.argument<String>("channelName")
                         if (paths.isNullOrEmpty() || packageName.isNullOrBlank()) {
                             result.error("bad_args", "paths/packageName required", null)
                             return@setMethodCallHandler
@@ -194,6 +195,7 @@ class MainActivity : FlutterActivity() {
                                     title,
                                     youtubeUrl,
                                     hooksJson,
+                                    channelName,
                                 ),
                             )
                         } catch (e: Exception) {
@@ -625,6 +627,7 @@ class MainActivity : FlutterActivity() {
         title: String,
         youtubeUrl: String?,
         hooksJson: String?,
+        channelName: String? = null,
     ): String {
         val authority = "${applicationContext.packageName}.fileprovider"
         val uris = ArrayList<Uri>()
@@ -651,6 +654,11 @@ class MainActivity : FlutterActivity() {
             putExtra(Intent.EXTRA_TITLE, title)
             putExtra("source", "yt_downloader")
             if (!youtubeUrl.isNullOrBlank()) putExtra("youtube_url", youtubeUrl)
+            if (!channelName.isNullOrBlank()) {
+                // Optional; Klippod may read either key for caption Sumber line.
+                putExtra("channel_name", channelName)
+                putExtra("source_channel", channelName)
+            }
             if (!hooksJson.isNullOrBlank()) {
                 putExtra("hooks_json", hooksJson)
                 putExtra(Intent.EXTRA_TEXT, hooksJson)
