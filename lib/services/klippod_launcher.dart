@@ -43,6 +43,7 @@ class KlippodLauncher {
     required String title,
     required String youtubeUrl,
     required String hooksJson,
+    String? channelName,
   }) async {
     try {
       final installed = await isInstalled();
@@ -50,6 +51,7 @@ class KlippodLauncher {
         return const KlippodOpenOutcome(KlippodOpenResult.notInstalled);
       }
 
+      final channel = channelName?.trim();
       final mode = await _channel.invokeMethod<String>(
         'openClipsInKlippod',
         {
@@ -58,6 +60,7 @@ class KlippodLauncher {
           'title': title,
           'youtubeUrl': youtubeUrl,
           'hooksJson': hooksJson,
+          if (channel != null && channel.isNotEmpty) 'channelName': channel,
         },
       );
 

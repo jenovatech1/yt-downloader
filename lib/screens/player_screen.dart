@@ -657,6 +657,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (_clips.isEmpty || _openingKlippod) return;
     setState(() => _openingKlippod = true);
     try {
+      final channel = widget.video.author.trim();
       final hooksJson = jsonEncode({
         'schemaVersion': 3,
         'source': 'yt_downloader',
@@ -664,6 +665,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
         'youtubeUrl':
             _clipsYoutubeUrl ??
             'https://www.youtube.com/watch?v=${widget.video.id.value}',
+        // Optional for Klippod captions (`Sumber: <channel>`). Both keys for
+        // older/newer parsers; ignore if blank.
+        if (channel.isNotEmpty) 'channelName': channel,
+        if (channel.isNotEmpty) 'sourceChannel': channel,
         'skipDetect': true,
         'skipWhisper': true,
         if (_clipsTranscript != null) 'transcript': _clipsTranscript!.toJson(),
@@ -686,6 +691,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
             _clipsYoutubeUrl ??
             'https://www.youtube.com/watch?v=${widget.video.id.value}',
         hooksJson: hooksJson,
+        channelName: channel.isEmpty ? null : channel,
       );
       if (!mounted) return;
       await _handleKlippodOutcome(outcome);
